@@ -1,0 +1,8 @@
+.env
+*.pem
+data/
+models/artifacts/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
