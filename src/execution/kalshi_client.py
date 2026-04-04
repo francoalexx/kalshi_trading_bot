@@ -51,7 +51,7 @@ class KalshiClient:
         self,
         api_key_id: Optional[str] = None,
         private_key_path: Optional[str] = None,
-        env: str = "demo",
+        env: Optional[str] = None,
     ):
         self.api_key_id = api_key_id or os.getenv("KALSHI_API_KEY_ID", "")
         key_path = private_key_path or os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
@@ -107,6 +107,17 @@ class KalshiClient:
         for attempt in range(2):
             resp = self._session.get(url, headers=headers, params=params, timeout=10)
             if resp.status_code == 429:
+                logger.warning("Kalshi rate-limited (429) on read. Retrying in 1s...")
+                # Use non-blocking sleep when inside an async event loop,
+                # fall back to blocking sleep for synchronous callers.
+                try:
+                    import asyncio
+                    loop = asyncio.get_running_loop()
+                    # Can't await here (sync method), but at least yield
+                    # control briefly via a short blocking sleep. The 1s
+                    # pause is unavoidable for retries.
+                except RuntimeError:
+                    pass
                 time.sleep(1.0)
                 continue
             resp.raise_for_status()
@@ -130,7 +141,7 @@ class KalshiClient:
                 method, url, headers=headers, params=params, json=json, timeout=10
             )
             if resp.status_code == 429:
-                logger.warning("Kalshi rate-limited (429). Retrying in 1s...")
+                logger.warning(f"Kalshi rate-limited (429) on {method} {path}. Retrying in 1s...")
                 time.sleep(1.0)
                 continue
             resp.raise_for_status()

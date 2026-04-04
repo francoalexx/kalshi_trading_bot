@@ -9,23 +9,28 @@ Architecture flow (per 1-minute bar close):
   5. RiskManager checks position/loss/rate limits
   6. ExecutionController sizes position (Kelly) and places limit order
   7. Order is monitored until fill or T-90s cancellation
+  8. Settlement monitor polls Kalshi for results and updates all systems
 
 Paper mode (--paper flag): all steps run but no real orders are placed.
-  Set KALSHI_PRIVATE_KEY_PATH to a non-existent path to auto-enter dry-run.
+Live mode: real orders via Kalshi API; settlement tracked identically.
 
 Usage:
     python -m src.main --paper                     # paper trading mode
+    python -m src.main                             # live trading mode
     python -m src.main --cnn models/artifacts/cnn_lstm_best.pt \
                        --xgb models/artifacts/xgboost_best.pkl
 """
 
 import argparse
+import ast
 import asyncio
 import os
 import signal as _signal
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -44,6 +49,7 @@ from src.learning.trade_journal import TradeJournal
 from src.learning.heuristics import HeuristicsEngine
 from src.learning.postmortem import PostmortemEngine
 from src.learning.attribution import AttributionAnalyzer
+from src.notifications import send_settlement_email
 
 load_dotenv()
 
@@ -51,6 +57,26 @@ load_dotenv()
 logger.remove()
 logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
 logger.add("logs/bot_{time:YYYY-MM-DD}.log", level="DEBUG", rotation="00:00")
+
+
+# ─── Pending trade: unified tracking for both paper and live ─────────────────
+
+@dataclass
+class PendingTrade:
+    """Tracks an open trade awaiting settlement (paper or live)."""
+    ticker:            str
+    side:              str        # "yes" or "no"
+    contracts:         int
+    entry_price:       float     # 0-1 scale
+    expiry_ts:         float     # unix epoch
+    signal_edge:       float
+    journal_trade_id:  Optional[int] = None
+    paper_trade:       object = None   # PaperTrade (paper mode only)
+    settled:           bool = False
+
+
+SETTLEMENT_POLL_INTERVAL = 30   # seconds between settlement checks
+SETTLEMENT_TIMEOUT       = 600  # give up after 10 minutes post-expiry
 
 
 async def run_bot(
@@ -73,6 +99,14 @@ async def run_bot(
     )
 
     kalshi = KalshiClient(env=os.getenv("KALSHI_ENV", "demo"))
+
+    # Validate credentials for live trading
+    if not paper_mode and kalshi._private_key is None:
+        logger.critical(
+            "LIVE MODE requires a valid Kalshi private key. "
+            "Set KALSHI_PRIVATE_KEY_PATH in .env or use --paper."
+        )
+        sys.exit(1)
 
     binance_feed = BinanceFeed()
     # Always use real Kalshi markets (even in paper mode) so we test on the
@@ -104,6 +138,9 @@ async def run_bot(
     # Inject heuristics engine into alpha so rules fire on every signal
     alpha.heuristics_engine = heuristics
 
+    # ── Unified pending-trade list (paper + live) ────────────────────────
+    pending_trades: List[PendingTrade] = []
+
     # ── SIGINT handler → graceful kill switch ────────────────────────────
     def _handle_sigint(sig, frame):
         logger.warning("SIGINT received. Shutting down.")
@@ -111,62 +148,151 @@ async def run_bot(
 
     _signal.signal(_signal.SIGINT, _handle_sigint)
 
-    logger.info(f"Bot starting — paper={paper_mode} bankroll=${bankroll:.2f}")
+    mode_label = "PAPER" if paper_mode else "LIVE"
+    logger.info(f"Bot starting — mode={mode_label} bankroll=${bankroll:.2f}")
 
-    # ── Paper settlement monitor: polls Kalshi for market results ────────
-    async def monitor_paper_settlements():
+    # ── Settlement monitor: polls Kalshi for market results ──────────────
+    async def monitor_settlements():
         """
-        Every 30s check expired paper trades and settle them using the
-        real Kalshi market result ("yes" / "no").  Waits up to 10 min
-        after expiry for Kalshi to post the result.
+        Every 30s check expired trades and settle them using the real
+        Kalshi market result ("yes" / "no"). Works for both paper and
+        live trades. Updates risk manager, journal, postmortem, and
+        sends email notifications.
         """
         while True:
-            await asyncio.sleep(30)
-            if paper is None:
-                continue
+            await asyncio.sleep(SETTLEMENT_POLL_INTERVAL)
             now = time.time()
-            for trade in paper._trades:
-                if trade.settled:
+
+            for pt in pending_trades:
+                if pt.settled:
                     continue
-                if trade.expiry_ts > now:
+                if pt.expiry_ts > now:
                     continue   # not yet expired
-                if now - trade.expiry_ts > 600:
-                    # Gave up waiting after 10 min — shouldn't happen normally
-                    logger.warning(f"Settlement timeout for {trade.ticker} — marking as loss")
-                    paper.settle_by_result(trade, "no" if trade.side == "yes" else "yes")
+
+                if now - pt.expiry_ts > SETTLEMENT_TIMEOUT:
+                    logger.warning(
+                        f"Settlement timeout for {pt.ticker} — marking as loss"
+                    )
+                    _settle_trade(pt, won=False)
                     continue
+
                 try:
-                    raw = kalshi._read_request(f"/markets/{trade.ticker}")
-                    mkt = raw.get("market", raw)
-                    result = mkt.get("result", "")
-                    # Kalshi sometimes wraps scalar values in a list e.g. '[9.56E-2]'
-                    # or returns a list object — normalise to plain string.
-                    if isinstance(result, list):
-                        result = result[0] if result else ""
-                    if isinstance(result, str) and result.startswith("["):
-                        import ast
-                        try:
-                            parsed = ast.literal_eval(result)
-                            result = parsed[0] if isinstance(parsed, list) else str(parsed)
-                        except Exception:
-                            result = result.strip("[]")
-                    result = str(result).strip().lower()
+                    result = _fetch_market_result(pt.ticker)
                     if result in ("yes", "no"):
-                        logger.info(f"Kalshi result for {trade.ticker}: {result.upper()}")
-                        paper.settle_by_result(trade, result)
-                        # ── Journal settlement ───────────────────────
-                        tid = getattr(trade, "_journal_trade_id", None)
-                        if tid is not None:
-                            outcome = "WIN" if trade.won else "LOSS"
-                            journal.log_settlement(tid, trade.pnl, trade.fee, outcome)
-                            postmortem.on_settlement(tid, trade.pnl, trade.fee, outcome)
+                        logger.info(
+                            f"Kalshi result for {pt.ticker}: {result.upper()}"
+                        )
+                        won = (pt.side == result)
+                        _settle_trade(pt, won=won)
                 except Exception as exc:
-                    logger.debug(f"Settlement poll error for {trade.ticker}: {exc}")
+                    logger.debug(
+                        f"Settlement poll error for {pt.ticker}: {exc}"
+                    )
+
+    def _fetch_market_result(ticker: str) -> str:
+        """Fetch and normalise the market result from Kalshi API."""
+        raw = kalshi._read_request(f"/markets/{ticker}")
+        mkt = raw.get("market", raw)
+        result = mkt.get("result", "")
+        # Kalshi sometimes wraps scalar values in a list e.g. '[9.56E-2]'
+        if isinstance(result, list):
+            result = result[0] if result else ""
+        if isinstance(result, str) and result.startswith("["):
+            try:
+                parsed = ast.literal_eval(result)
+                result = parsed[0] if isinstance(parsed, list) else str(parsed)
+            except Exception:
+                result = result.strip("[]")
+        return str(result).strip().lower()
+
+    def _settle_trade(pt: PendingTrade, won: bool) -> None:
+        """
+        Handle settlement for both paper and live trades:
+        1. Compute P&L and fees
+        2. Update paper tracker (paper mode) or risk manager (live mode)
+        3. Log to trade journal
+        4. Run postmortem analysis
+        5. Send email notification
+        6. Update controller bankroll
+        """
+        # ── P&L calculation (same formula for paper and live) ────────
+        if won:
+            gross_pnl = (1.0 - pt.entry_price) * pt.contracts
+        else:
+            gross_pnl = -pt.entry_price * pt.contracts
+
+        fee = 0.07 * pt.entry_price * (1 - pt.entry_price) * pt.contracts
+        net_pnl = gross_pnl - fee
+        outcome = "WIN" if won else "LOSS"
+
+        pt.settled = True
+
+        # ── Paper tracker (paper mode) ───────────────────────────────
+        if paper is not None and pt.paper_trade is not None:
+            paper.settle_by_result(
+                pt.paper_trade,
+                pt.side if won else ("no" if pt.side == "yes" else "yes"),
+            )
+
+        # ── Risk manager update (both modes) ─────────────────────────
+        risk.record_settlement(
+            contracts_won=pt.contracts if won else 0,
+            contracts_lost=pt.contracts if not won else 0,
+            gross_pnl=net_pnl,
+            fees_paid=fee,
+        )
+
+        # ── Update controller bankroll for correct Kelly sizing ──────
+        controller.update_bankroll(risk.bankroll)
+
+        # ── Journal + postmortem ─────────────────────────────────────
+        if pt.journal_trade_id is not None:
+            journal.log_settlement(
+                pt.journal_trade_id, net_pnl, fee, outcome
+            )
+            postmortem.on_settlement(
+                pt.journal_trade_id, net_pnl, fee, outcome
+            )
+
+        # ── Email notification (live mode — paper uses PaperTracker) ─
+        if paper is None:
+            _send_live_email(pt, won, net_pnl, fee)
+
+        result_str = "WIN" if won else "LOSS"
+        logger.info(
+            f"[{mode_label}] Trade settled — {result_str} | "
+            f"pnl={net_pnl:+.2f} fee={fee:.2f} | "
+            f"bankroll=${risk.bankroll:.2f}"
+        )
+
+    def _send_live_email(pt: PendingTrade, won: bool, pnl: float, fee: float):
+        """Send email notification for live trade settlement."""
+        from types import SimpleNamespace
+
+        current = SimpleNamespace(
+            trade_id=pt.journal_trade_id or 0,
+            side=pt.side,
+            contracts=pt.contracts,
+            entry_price=pt.entry_price,
+            won=won,
+            pnl=pnl,
+            fee=fee,
+        )
+
+        try:
+            send_settlement_email(
+                trade=current,
+                bankroll=risk.bankroll,
+                start_bankroll=bankroll,
+                settled_trades=[current],
+            )
+        except Exception as exc:
+            logger.warning(f"Email notification failed: {exc}")
 
     # ── Start background tasks ───────────────────────────────────────────
-    asyncio.create_task(binance_feed.run(),          name="binance_feed")
-    asyncio.create_task(market_feed.run(),           name="market_feed")
-    asyncio.create_task(monitor_paper_settlements(), name="settlement_monitor")
+    asyncio.create_task(binance_feed.run(),       name="binance_feed")
+    asyncio.create_task(market_feed.run(),        name="market_feed")
+    asyncio.create_task(monitor_settlements(),    name="settlement_monitor")
 
     # ── Candle buffer for indicator computation ──────────────────────────
     candle_df_rows = []
@@ -272,20 +398,33 @@ async def run_bot(
                 kelly_fraction=getattr(result, "kelly_fraction", 0.0),
             )
 
-            # ── Paper P&L tracking ───────────────────────────────────
-            if paper is not None and result.filled > 0:
+            # ── Track for settlement (both paper and live) ───────────
+            if result.filled > 0:
                 entry = result.avg_fill_price or market.yes_ask
-                paper_trade = paper.record_trade(
+                pt = PendingTrade(
                     ticker=result.ticker,
                     side=result.side,
                     contracts=result.filled,
                     entry_price=entry,
                     expiry_ts=market.expiry_ts,
                     signal_edge=signal.net_edge,
+                    journal_trade_id=trade_id,
                 )
-                # Store trade_id on paper_trade so settlement monitor can update journal
-                paper_trade._journal_trade_id = trade_id
-                # Settlement handled by monitor_paper_settlements() coroutine
+
+                # Paper mode: also record in PaperTracker for dashboard
+                if paper is not None:
+                    paper_trade = paper.record_trade(
+                        ticker=result.ticker,
+                        side=result.side,
+                        contracts=result.filled,
+                        entry_price=entry,
+                        expiry_ts=market.expiry_ts,
+                        signal_edge=signal.net_edge,
+                    )
+                    pt.paper_trade = paper_trade
+
+                pending_trades.append(pt)
+                # Settlement handled by monitor_settlements() coroutine
 
 
 def main():

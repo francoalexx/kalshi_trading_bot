@@ -22,7 +22,7 @@ print(f"  Last line  : {pem_contents.splitlines()[-1]}")
 print(f"  Total lines: {len(pem_contents.splitlines())}")
 
 from src.execution.kalshi_client import KalshiClient
-client = KalshiClient()
+client = KalshiClient(env=os.getenv("KALSHI_ENV", "demo"))
 print(f"  Private key loaded: {client._private_key is not None}")
 try:
     from datetime import datetime, timezone

@@ -21,6 +21,9 @@ aiohttp>=3.9.0
 requests>=2.32.0
 cryptography>=42.0.0
 
+# Notifications
+resend>=2.0.0
+
 # Utilities
 python-dotenv>=1.0.1
 loguru>=0.7.2

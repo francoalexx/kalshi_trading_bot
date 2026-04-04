@@ -15,6 +15,8 @@ from typing import List, Optional
 
 from loguru import logger
 
+from src.notifications import send_settlement_email
+
 
 @dataclass
 class PaperTrade:
@@ -125,6 +127,12 @@ class PaperTracker:
             f"bankroll=${self._bankroll:.2f}"
         )
         self.print_dashboard()
+        send_settlement_email(
+            trade=trade,
+            bankroll=self._bankroll,
+            start_bankroll=self._start,
+            settled_trades=[t for t in self._trades if t.settled],
+        )
 
     def print_dashboard(self) -> None:
         """Print current paper trading performance to console."""

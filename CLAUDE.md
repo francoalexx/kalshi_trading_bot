@@ -15,8 +15,8 @@ direction using a dual ML ensemble. Goal: compound a $500 bankroll to $100+/day
 revenue through continuous learning, disciplined risk management, and statistical
 promotion of improved models.
 
-**Current environment:** `KALSHI_ENV=demo` (paper mode on real Kalshi markets)
-**Starting bankroll:** $500 | **Target:** $100/day at ~$3,000–$5,000 bankroll
+**Current environment:** `KALSHI_ENV=prod` (live trading on Kalshi)
+**Starting bankroll:** $100 (live test) | **Target:** $100/day at ~$3,000–$5,000 bankroll
 
 ---
 
@@ -172,6 +172,12 @@ pytest tests/ -v
 # Diagnose Kalshi API connectivity + market availability
 python diagnose.py
 
+# Export trade history CSV from SQLite (rerunnable)
+python export_trades.py
+
+# Run deep-dive trade analysis → data/analysis_report.md
+python analysis.py
+
 # Query the trade journal
 python -c "
 from src.learning.trade_journal import TradeJournal
@@ -242,6 +248,44 @@ float wrapped in a JSON array rendered as a string. Settlement monitor now
 strips brackets before checking for `"yes"`/`"no"`. If settlements stop working,
 check this parsing first.
 
+### signal_edge / kelly_fraction not saved to journal (fixed 2026-04-04)
+`OrderResult` dataclass was missing `signal_edge` and `kelly_fraction` fields.
+`log_trade()` always saved `None`, causing the postmortem engine to classify
+every loss as `ALPHA_DECAY` (since `None` coerces to 0.0 < threshold).
+Fix: added both fields to `OrderResult`, populated from `signal` and `_kelly_size()`
+in `controller.py`. `_kelly_size()` now returns `(position_usd, f_half)` tuple.
+Failure classifications will be meaningful from trade #119 onward.
+
+### Console log level raised to INFO (2026-04-04)
+`src/main.py` stderr logger changed from `DEBUG` to `INFO`. Debug-level candle
+and market-poll messages now go to the log file only. Console shows trades,
+signals, warnings, and errors only.
+
+### Live settlement monitor was missing (fixed 2026-04-04)
+**What happened:** Pre-live audit found that `monitor_paper_settlements()` only ran
+in paper mode. In live mode, after an order filled, the bot completely forgot about
+it — no P&L tracking, no bankroll update, no risk manager integration. This meant:
+- `risk.record_settlement()` was never called (daily loss limit inert)
+- Controller bankroll never updated (Kelly sizing became stale)
+- No journal logging or postmortem analysis for live trades
+- No email notifications for live settlements
+
+**Fix:** Replaced `monitor_paper_settlements()` with unified `monitor_settlements()`
+that works for both paper and live trades. New `PendingTrade` dataclass tracks all
+open trades. `_settle_trade()` handles the full settlement flow: P&L calculation,
+risk manager update, controller bankroll sync, journal + postmortem logging, and
+email notifications.
+
+### KalshiClient env parameter bug (fixed 2026-04-04)
+`KalshiClient.__init__` had `env: str = "demo"` as default, which shadowed the
+`.env` file's `KALSHI_ENV` setting. The `env or os.getenv(...)` fallback never
+triggered because `"demo"` is truthy. Fixed by changing default to `None`.
+Also fixed `diagnose.py` to pass `env` explicitly.
+
+### Live mode credential validation (added 2026-04-04)
+Bot now exits with a clear error if started in live mode without a valid Kalshi
+private key, instead of silently entering DRY_RUN mode where orders are faked.
+
 ---
 
 ## File Map (Critical Paths)
@@ -267,9 +311,15 @@ check this parsing first.
 | Shadow model | `src/learning/shadow_model.py` |
 | Optuna + promotion | `src/learning/adaptation.py` |
 | Paper P&L tracker | `src/paper_tracker.py` |
+| Email notifications | `src/notifications.py` |
+| Trade history export | `export_trades.py` |
+| Trade analysis | `analysis.py` |
+| Diagnostics | `diagnose.py` |
 | Config | `.env` (gitignored) |
 | Historical data | `data/btc_1m.parquet` |
-| Trade history | `data/trade_journal.db` |
+| Trade history DB | `data/trade_journal.db` |
+| Trade history CSV | `data/trade_history.csv` |
+| Analysis report | `data/analysis_report.md` |
 | Heuristics rules | `data/heuristics.json` |
 
 ---
@@ -291,16 +341,27 @@ check this parsing first.
 - [x] OTM guard (market_price bounds [0.15, 0.85]) — critical bug fix
 - [x] ATM staleness filter in KalshiFeed (withhold OTM markets)
 - [x] Kalshi settlement result parsing fix (bracketed float strings)
+- [x] signal_edge and kelly_fraction now correctly saved to trade journal
+- [x] Console logging raised to INFO (debug noise to file only)
+- [x] Trade history CSV export (`export_trades.py` with timestamps)
+- [x] Deep-dive trade analysis report (`analysis.py` → `data/analysis_report.md`)
+- [x] Email notifications on trade settlement via Resend (`src/notifications.py`)
+- [x] Unified settlement monitor for both paper AND live modes
+- [x] Live mode: risk manager, journal, postmortem, email all wired up
+- [x] Live mode credential validation (exits if no private key)
+- [x] KalshiClient env parameter bug fix (KALSHI_ENV now respected)
+- [x] Paper run complete — 124 trades (56.5% win rate, +$2,082 net from $500)
 
 ### 🔄 In Progress
-- [ ] Fresh paper run with OTM guard active — establish clean baseline win rate
-- [ ] Accumulate 50+ valid ATM-traded settled trades for first SHAP cycle
+- [ ] First live trading run — $100 bankroll on prod (started 2026-04-04)
+- [ ] Monitor first 5-10 live trades for correct settlement flow
+- [ ] Accumulate live trades for comparison with paper performance
 
 ### 🗓 Next Milestones
 - [ ] **Phase 4:** First SHAP report — identify top 3 alpha features
 - [ ] **Phase 5:** First Optuna study after 100 settled trades
 - [ ] **Phase 6:** Shadow model promotion if candidate params improve Sharpe
-- [ ] **Phase 7:** Scale to live trading at $500 bankroll after 14 stable paper days
+- [ ] **Phase 7:** Scale live bankroll to $500 after stable live results
 - [ ] **Phase 8:** Compound bankroll toward $1,500 target for $30–$40/day EV
 
 ### 💰 Revenue Milestones
