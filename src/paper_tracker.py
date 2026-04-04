@@ -74,6 +74,18 @@ class PaperTracker:
         )
         return trade
 
+    def settle_by_result(self, trade: PaperTrade, market_result: str) -> None:
+        """
+        Settle a paper trade given the Kalshi market result string.
+
+        Parameters
+        ----------
+        trade         : the PaperTrade to settle
+        market_result : "yes" or "no" — the side that won on Kalshi
+        """
+        won = (trade.side == market_result)
+        self._finish_settlement(trade, won)
+
     def settle_trade(self, trade: PaperTrade, btc_went_up: bool) -> None:
         """
         Settle a paper trade given the actual BTC outcome.
@@ -85,7 +97,13 @@ class PaperTracker:
         """
         won = (trade.side == "yes" and btc_went_up) or \
               (trade.side == "no"  and not btc_went_up)
+        self._finish_settlement(trade, won)
 
+    def _finish_settlement(self, trade: PaperTrade, won: bool) -> None:
+        """Common settlement logic shared by both settle methods."""
+
+        if trade.settled:
+            return
         if won:
             gross_pnl = (1.0 - trade.entry_price) * trade.contracts
         else:

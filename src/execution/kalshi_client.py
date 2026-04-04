@@ -36,7 +36,7 @@ from loguru import logger
 load_dotenv()
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_BASE = "https://trading-api.kalshi.co/trade-api/v2"
+PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 
 class KalshiClient:
@@ -57,7 +57,9 @@ class KalshiClient:
         key_path = private_key_path or os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
         env = env or os.getenv("KALSHI_ENV", "demo")
 
-        self.base_url = DEMO_BASE if env == "demo" else PROD_BASE
+        # Orders go to demo (paper-safe) or prod; market data always from prod
+        self.base_url  = DEMO_BASE if env == "demo" else PROD_BASE
+        self.read_url  = PROD_BASE   # BTC markets only exist on prod
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
@@ -96,6 +98,21 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
         }
 
+    def _read_request(self, path: str, params: Optional[Dict] = None) -> Any:
+        """Signed GET against prod (for market data — only exists on prod)."""
+        url = self.read_url + path
+        # Prod requires the full path including version prefix in the signature
+        full_path = "/trade-api/v2" + path
+        headers = self._sign("GET", full_path)
+        for attempt in range(2):
+            resp = self._session.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 429:
+                time.sleep(1.0)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise RuntimeError(f"Kalshi GET {path} failed after retry.")
+
     def _request(
         self,
         method: str,
@@ -103,9 +120,10 @@ class KalshiClient:
         params: Optional[Dict] = None,
         json: Optional[Dict] = None,
     ) -> Any:
-        """Make a signed request; retry once on 429."""
+        """Make a signed request against the configured env (demo or prod); retry once on 429."""
         url = self.base_url + path
-        headers = self._sign(method, path)
+        full_path = "/trade-api/v2" + path
+        headers = self._sign(method, full_path)
 
         for attempt in range(2):
             resp = self._session.request(
@@ -124,21 +142,81 @@ class KalshiClient:
 
     def get_btc_markets(self) -> List[Dict]:
         """
-        Return active BTC Up/Down prediction markets.
-        Filters for series ticker containing 'BTC' and status == 'open'.
+        Return active BTC prediction markets from prod, prioritising near-ATM markets.
+
+        Paginates through the KXBTC series until it finds markets with YES price
+        in the 0.35–0.65 band (at-the-money).  Falls back to all found markets if
+        none are ATM (e.g. very directional market days).
         """
-        data = self._request("GET", "/markets", params={
-            "series_ticker": "BTCUSD",
-            "status": "open",
-            "limit": 50,
-        })
-        markets = data.get("markets", [])
-        logger.debug(f"Found {len(markets)} open BTC markets.")
-        return markets
+        ATM_LO, ATM_HI = 0.30, 0.70   # acceptable YES price window
+        all_markets: List[Dict] = []
+        cursor: Optional[str] = None
+        pages = 0
+
+        # Try 15-minute markets first (KXBTC15M), fall back to daily (KXBTC)
+        for series in ("KXBTC15M", "KXBTC"):
+            cursor = None
+            pages  = 0
+            series_markets: List[Dict] = []
+
+            while pages < 10:
+                params: Dict = {"status": "open", "series_ticker": series, "limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    data = self._read_request("/markets", params=params)
+                except Exception as exc:
+                    logger.warning(f"Kalshi {series} fetch failed: {exc}")
+                    break
+
+                page = data.get("markets", [])
+                if not page:
+                    break
+
+                series_markets.extend(page)
+                pages += 1
+
+                # Stop early once ATM markets found
+                if any(ATM_LO <= float(m.get("yes_ask_dollars") or 0) <= ATM_HI for m in page):
+                    break
+
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+
+            if series_markets:
+                logger.debug(
+                    f"Found {len(series_markets)} open BTC markets "
+                    f"via series_ticker={series} ({pages} page(s))."
+                )
+                all_markets = series_markets
+                break   # prefer 15-min; don't fall through to daily
+
+        logger.debug(f"Using {len(all_markets)} BTC markets total.")
+        return all_markets
 
     def get_orderbook(self, ticker: str, depth: int = 10) -> Dict:
-        """Return the order book for a market ticker."""
-        return self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
+        """
+        Return parsed order book for a market ticker.
+
+        Kalshi returns: {'orderbook_fp': {'yes_dollars': [[price, size], ...],
+                                          'no_dollars':  [[price, size], ...]}}
+        Prices are 0-1 scale strings.  We normalise to the legacy format:
+            {'yes': {'bid': [float, ...], 'ask': [float, ...]},
+             'no':  {'bid': [float, ...], 'ask': [float, ...]}}
+        """
+        raw = self._read_request(f"/markets/{ticker}/orderbook", params={"depth": depth})
+        ob  = raw.get("orderbook_fp", {})
+
+        # yes_dollars: sorted best-ask first (lowest price = cheapest YES)
+        yes_prices = [float(row[0]) for row in ob.get("yes_dollars", [])]
+        # no_dollars: sorted best-bid first (highest price = most expensive NO)
+        no_prices  = [float(row[0]) for row in ob.get("no_dollars",  [])]
+
+        return {
+            "yes": {"ask": yes_prices, "bid": []},
+            "no":  {"ask": [],         "bid": no_prices},
+        }
 
     def get_balance(self) -> float:
         """Return available balance in USD (cents → dollars)."""

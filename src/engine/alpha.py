@@ -29,6 +29,9 @@ from loguru import logger
 from src.models.cnn_lstm import CNNLSTMModel
 from src.models.xgboost_clf import XGBoostClassifier
 
+# HeuristicsEngine is optional — imported lazily to avoid circular imports
+_heuristics_engine = None
+
 
 # ─── Kalshi fee formula at probability p ─────────────────────────────────────
 # fee = 0.07 × p × (1 - p)
@@ -65,10 +68,13 @@ class AlphaEngine:
     cnn_weight     : weight for CNN-LSTM in ensemble (XGB weight = 1 - cnn_weight)
     """
 
-    CNN_YES_THRESHOLD = 0.62
-    CNN_NO_THRESHOLD  = 0.38
-    XGB_YES_THRESHOLD = 0.60
-    XGB_NO_THRESHOLD  = 0.40
+    # Thresholds calibrated to live model output range (XGB: 0.41-0.66, CNN: 0.47-0.55)
+    # Restored to 0.54/0.46 after paper trading confirmed 0.52/0.48 generates too many
+    # marginal signals that are below the fee floor once OTM markets are excluded.
+    XGB_YES_THRESHOLD = 0.54
+    XGB_NO_THRESHOLD  = 0.46
+    CNN_YES_THRESHOLD = 0.50   # CNN is near-random; just needs to not disagree
+    CNN_NO_THRESHOLD  = 0.50
     TREND_STRENGTH_THRESHOLD = 0.5  # below → ranging regime
 
     def __init__(
@@ -78,11 +84,13 @@ class AlphaEngine:
         min_net_edge: float = 0.02,
         cnn_weight: float = 0.55,
         device: str = "cpu",
+        heuristics_engine=None,
     ):
-        self.min_net_edge = min_net_edge
-        self.cnn_weight   = cnn_weight
-        self.xgb_weight   = 1.0 - cnn_weight
-        self.device       = device
+        self.min_net_edge     = min_net_edge
+        self.cnn_weight       = cnn_weight
+        self.xgb_weight       = 1.0 - cnn_weight
+        self.device           = device
+        self.heuristics_engine = heuristics_engine
 
         logger.info(f"Loading CNN-LSTM from {cnn_lstm_path}...")
         from src.models.cnn_lstm import load_cnn_lstm
@@ -99,6 +107,7 @@ class AlphaEngine:
         features: Dict[str, float],
         market_price: float,
         spread: float,
+        strike_type: str = "greater",
     ) -> TradeSignal:
         """
         Generate a trading signal.
@@ -109,7 +118,27 @@ class AlphaEngine:
         features     : dict of tabular features — for XGBoost
         market_price : current Kalshi YES ask price (0-1 scale)
         spread       : current Kalshi YES bid-ask spread (0-1 scale)
+        strike_type  : "greater" = YES pays if BTC > strike (T-markets)
+                       "less"    = YES pays if BTC < strike (B-markets)
         """
+        # ── OTM guard ────────────────────────────────────────────────────
+        # The model outputs P(BTC direction) which only approximates P(YES wins)
+        # for near-ATM markets. For deeply OTM markets (< 15¢ or > 85¢) the
+        # strike is far from current price and any apparent edge is illusory.
+        # Waiting for the next ATM market is always better than trading OTM.
+        OTM_LOW  = 0.15
+        OTM_HIGH = 0.85
+        if market_price < OTM_LOW or market_price > OTM_HIGH:
+            logger.debug(
+                f"OTM guard: market_price={market_price:.3f} outside [{OTM_LOW},{OTM_HIGH}] "
+                "— skipping bar, waiting for ATM market."
+            )
+            return TradeSignal(
+                direction=Direction.NO_TRADE,
+                cnn_lstm_prob=0.5, xgb_prob=0.5, ensemble_prob=0.5,
+                market_price=market_price, net_edge=0.0, regime="unknown",
+            )
+
         # ── Regime detection ─────────────────────────────────────────────
         regime = self._detect_regime(features)
 
@@ -132,20 +161,44 @@ class AlphaEngine:
 
         ensemble_prob = cnn_w * cnn_prob + xgb_w * xgb_prob
 
-        # ── Direction logic ──────────────────────────────────────────────
+        # ── Adjust for market direction ──────────────────────────────────
+        # ensemble_prob = P(BTC goes UP) from models
+        # "greater" / "greater_or_equal": YES pays if BTC goes UP  → p_yes = P(up)
+        # "less"    / "less_or_equal":    YES pays if BTC goes DOWN → p_yes = 1 - P(up)
+        bearish_market = strike_type in ("less", "less_or_equal")
+        if bearish_market:
+            p_yes = 1.0 - ensemble_prob
+        else:
+            p_yes = ensemble_prob
+
+        # ── Log live probabilities every bar so we can tune thresholds ──────
+        logger.debug(
+            f"Probs: cnn={cnn_prob:.3f} xgb={xgb_prob:.3f} ensemble={ensemble_prob:.3f} "
+            f"p_yes={p_yes:.3f} regime={regime} market={strike_type}"
+        )
+
+        # ── Direction logic (based on P(YES wins) vs market price) ──────
         direction = Direction.NO_TRADE
         if cnn_prob > self.CNN_YES_THRESHOLD and xgb_prob > self.XGB_YES_THRESHOLD:
-            direction = Direction.BUY_YES
+            # Model strongly predicts BTC UP
+            if bearish_market:
+                direction = Direction.BUY_NO   # "below X" market: BTC up → NO wins
+            else:
+                direction = Direction.BUY_YES  # "above X" market: BTC up → YES wins
         elif cnn_prob < self.CNN_NO_THRESHOLD and xgb_prob < self.XGB_NO_THRESHOLD:
-            direction = Direction.BUY_NO
+            # Model strongly predicts BTC DOWN
+            if bearish_market:
+                direction = Direction.BUY_YES  # "below X" market: BTC down → YES wins
+            else:
+                direction = Direction.BUY_NO   # "above X" market: BTC down → NO wins
 
         # ── Net edge calculation ─────────────────────────────────────────
-        # For YES bet: edge = P_model - P_market (if positive)
-        # For NO  bet: edge = (1 - P_model) - (1 - P_market) = P_market - P_model
+        # p_yes is our model's estimate of P(YES wins)
+        # market_price is the current YES ask (what market thinks P(YES) is)
         if direction == Direction.BUY_YES:
-            gross_edge = ensemble_prob - market_price
+            gross_edge = p_yes - market_price
         elif direction == Direction.BUY_NO:
-            gross_edge = market_price - ensemble_prob
+            gross_edge = (1.0 - p_yes) - (1.0 - market_price)  # = market_price - p_yes
         else:
             gross_edge = 0.0
 
@@ -169,10 +222,15 @@ class AlphaEngine:
             regime=regime,
         )
 
-        if direction != Direction.NO_TRADE:
+        # ── Apply heuristic rules ─────────────────────────────────────────
+        if self.heuristics_engine is not None and direction != Direction.NO_TRADE:
+            signal = self.heuristics_engine.apply(features, signal, None)
+
+        if signal.direction != Direction.NO_TRADE:
             logger.info(
-                f"SIGNAL: {direction.value} | cnn={cnn_prob:.3f} xgb={xgb_prob:.3f} "
-                f"ensemble={ensemble_prob:.3f} net_edge={net_edge:.4f} regime={regime}"
+                f"SIGNAL: {signal.direction.value} | cnn={cnn_prob:.3f} xgb={xgb_prob:.3f} "
+                f"p_yes={p_yes:.3f} market={market_price:.3f} net_edge={signal.net_edge:.4f} "
+                f"regime={regime} strike={strike_type}"
             )
 
         return signal

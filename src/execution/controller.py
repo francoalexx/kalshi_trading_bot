@@ -48,6 +48,8 @@ class OrderResult:
     slippage:       float   # actual_fill - expected_fill
     cancelled:      bool
     outcome_ts:     Optional[float]  # unix seconds when market settles
+    signal_edge:    float = 0.0      # net_edge from TradeSignal
+    kelly_fraction: float = 0.0      # f_half used in sizing
 
 
 class ExecutionController:
@@ -65,11 +67,13 @@ class ExecutionController:
         risk_manager: RiskManager,
         bankroll: float,
         max_position_usd: Optional[float] = None,
+        paper_mode: bool = False,
     ):
         self._client       = client
         self._risk         = risk_manager
         self._bankroll     = bankroll
         self._max_pos      = max_position_usd or (bankroll * 0.05)
+        self._paper_mode   = paper_mode
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
@@ -110,7 +114,7 @@ class ExecutionController:
         limit_cents = max(1, min(99, limit_cents))   # Kalshi bounds
 
         # ── Position sizing ──────────────────────────────────────────────
-        position_usd = self._kelly_size(
+        position_usd, kelly_fraction = self._kelly_size(
             p_model=signal.ensemble_prob,
             p_market=limit_float,
         )
@@ -127,6 +131,25 @@ class ExecutionController:
             f"@ {limit_cents}¢ | kelly_size=${position_usd:.2f}"
         )
         self._risk.register_order_open()
+
+        # Paper mode: simulate instant fill, no Kalshi API call needed
+        if self._paper_mode:
+            result = OrderResult(
+                order_id=f"PAPER-{market.ticker}",
+                ticker=market.ticker,
+                side=side,
+                contracts=contracts,
+                limit_price=limit_float,
+                filled=contracts,
+                avg_fill_price=limit_float,
+                slippage=0.0,
+                cancelled=False,
+                outcome_ts=market.expiry_ts,
+                signal_edge=signal.net_edge,
+                kelly_fraction=kelly_fraction,
+            )
+            self._risk.register_order_closed(result.filled, result.avg_fill_price)
+            return result
 
         order = self._client.place_order(
             ticker=market.ticker,
@@ -152,27 +175,29 @@ class ExecutionController:
 
     # ─── Position Sizing ─────────────────────────────────────────────────────
 
-    def _kelly_size(self, p_model: float, p_market: float) -> float:
+    def _kelly_size(self, p_model: float, p_market: float):
         """
         Fractional Kelly position size in USD.
 
         b = net payout ratio (e.g., at 50¢ market price: b = 0.50/0.50 = 1.0)
         f* = (b × p_model - q) / b  where q = 1 - p_model
         size = 0.5 × f* × bankroll, capped at max_position_usd
+
+        Returns (position_usd, kelly_fraction).
         """
         if p_market <= 0 or p_market >= 1:
-            return 0.0
+            return 0.0, 0.0
 
         b = (1 - p_market) / p_market   # payout odds
         q = 1 - p_model
         f_full = (b * p_model - q) / b
 
         if f_full <= 0:
-            return 0.0  # no edge
+            return 0.0, 0.0  # no edge
 
         f_half = 0.5 * f_full
         position = f_half * self._bankroll
-        return min(position, self._max_pos)
+        return min(position, self._max_pos), f_half
 
     # ─── Fill Monitoring ─────────────────────────────────────────────────────
 

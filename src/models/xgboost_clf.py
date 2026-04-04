@@ -19,7 +19,11 @@ from typing import Dict, List, Optional
 import numpy as np
 import xgboost as xgb
 
-from src.features.indicators import FEATURE_NAMES
+# These must match TABULAR_FEATURES in train.py exactly — the model was trained on these 10 features
+FEATURE_NAMES = [
+    "log_return", "log_return_2", "log_return_5", "rolling_vol_15",
+    "macd", "macd_hist", "rsi_14", "bb_width", "ema_delta", "volume_z",
+]
 
 
 class XGBoostClassifier:
@@ -99,6 +103,23 @@ class XGBoostClassifier:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump({"model": self._model, "feature_names": FEATURE_NAMES}, f)
+
+    def retrain(self, X: np.ndarray, y: np.ndarray, params: Optional[Dict] = None) -> None:
+        """
+        Retrain the model in-place with new data and optional new params.
+        Used by the shadow model manager for candidate param evaluation.
+
+        Parameters
+        ----------
+        X      : np.ndarray, shape (n_samples, n_features)
+        y      : np.ndarray, shape (n_samples,) — binary labels
+        params : optional dict to override current hyperparams
+        """
+        if params:
+            merged = {**self.DEFAULT_PARAMS, **params}
+            self._model = xgb.XGBClassifier(**merged)
+        self._model.fit(X, y, verbose=False)
+        self._fitted = True
 
     @classmethod
     def load(cls, path: str) -> "XGBoostClassifier":

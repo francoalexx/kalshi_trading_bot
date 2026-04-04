@@ -24,6 +24,7 @@ import asyncio
 import os
 import signal as _signal
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -39,6 +40,10 @@ from src.features.ofi import OFICalculator
 from src.engine.alpha import AlphaEngine, Direction
 from src.risk.manager import RiskManager
 from src.paper_tracker import PaperTracker
+from src.learning.trade_journal import TradeJournal
+from src.learning.heuristics import HeuristicsEngine
+from src.learning.postmortem import PostmortemEngine
+from src.learning.attribution import AttributionAnalyzer
 
 load_dotenv()
 
@@ -54,10 +59,10 @@ async def run_bot(
     paper_mode: bool = False,
 ):
     bankroll        = float(os.getenv("INITIAL_BANKROLL", "500"))
-    max_open        = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+    max_open        = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
     daily_loss_pct  = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.10"))
-    max_tph         = int(os.getenv("MAX_TRADES_PER_HOUR", "8"))
-    min_edge        = float(os.getenv("MIN_NET_EDGE", "0.02"))
+    max_tph         = int(os.getenv("MAX_TRADES_PER_HOUR", "20"))
+    min_edge        = float(os.getenv("MIN_NET_EDGE", "0.01"))
 
     # ── Component initialisation ─────────────────────────────────────────
     risk = RiskManager(
@@ -67,10 +72,13 @@ async def run_bot(
         max_trades_per_hour=max_tph,
     )
 
-    kalshi = KalshiClient(env="demo" if paper_mode else os.getenv("KALSHI_ENV", "demo"))
+    kalshi = KalshiClient(env=os.getenv("KALSHI_ENV", "demo"))
 
-    kalshi_feed = KalshiFeed(client=kalshi)
     binance_feed = BinanceFeed()
+    # Always use real Kalshi markets (even in paper mode) so we test on the
+    # exact same market data as live trading.  paper_mode only affects whether
+    # real orders are sent to the exchange.
+    market_feed = KalshiFeed(client=kalshi)
     ofi_calc = OFICalculator()
 
     alpha = AlphaEngine(
@@ -83,22 +91,82 @@ async def run_bot(
         client=kalshi,
         risk_manager=risk,
         bankroll=bankroll,
+        paper_mode=paper_mode,
     )
 
     paper = PaperTracker(starting_bankroll=bankroll) if paper_mode else None
 
+    # ── Learning system ──────────────────────────────────────────────────
+    journal    = TradeJournal()
+    heuristics = HeuristicsEngine()
+    analyzer   = AttributionAnalyzer(journal)
+    postmortem = PostmortemEngine(journal, analyzer)
+    # Inject heuristics engine into alpha so rules fire on every signal
+    alpha.heuristics_engine = heuristics
+
     # ── SIGINT handler → graceful kill switch ────────────────────────────
     def _handle_sigint(sig, frame):
-        logger.warning("SIGINT received. Triggering kill switch.")
-        risk.trigger_kill_switch("SIGINT")
+        logger.warning("SIGINT received. Shutting down.")
+        os._exit(0)
 
     _signal.signal(_signal.SIGINT, _handle_sigint)
 
     logger.info(f"Bot starting — paper={paper_mode} bankroll=${bankroll:.2f}")
 
+    # ── Paper settlement monitor: polls Kalshi for market results ────────
+    async def monitor_paper_settlements():
+        """
+        Every 30s check expired paper trades and settle them using the
+        real Kalshi market result ("yes" / "no").  Waits up to 10 min
+        after expiry for Kalshi to post the result.
+        """
+        while True:
+            await asyncio.sleep(30)
+            if paper is None:
+                continue
+            now = time.time()
+            for trade in paper._trades:
+                if trade.settled:
+                    continue
+                if trade.expiry_ts > now:
+                    continue   # not yet expired
+                if now - trade.expiry_ts > 600:
+                    # Gave up waiting after 10 min — shouldn't happen normally
+                    logger.warning(f"Settlement timeout for {trade.ticker} — marking as loss")
+                    paper.settle_by_result(trade, "no" if trade.side == "yes" else "yes")
+                    continue
+                try:
+                    raw = kalshi._read_request(f"/markets/{trade.ticker}")
+                    mkt = raw.get("market", raw)
+                    result = mkt.get("result", "")
+                    # Kalshi sometimes wraps scalar values in a list e.g. '[9.56E-2]'
+                    # or returns a list object — normalise to plain string.
+                    if isinstance(result, list):
+                        result = result[0] if result else ""
+                    if isinstance(result, str) and result.startswith("["):
+                        import ast
+                        try:
+                            parsed = ast.literal_eval(result)
+                            result = parsed[0] if isinstance(parsed, list) else str(parsed)
+                        except Exception:
+                            result = result.strip("[]")
+                    result = str(result).strip().lower()
+                    if result in ("yes", "no"):
+                        logger.info(f"Kalshi result for {trade.ticker}: {result.upper()}")
+                        paper.settle_by_result(trade, result)
+                        # ── Journal settlement ───────────────────────
+                        tid = getattr(trade, "_journal_trade_id", None)
+                        if tid is not None:
+                            outcome = "WIN" if trade.won else "LOSS"
+                            journal.log_settlement(tid, trade.pnl, trade.fee, outcome)
+                            postmortem.on_settlement(tid, trade.pnl, trade.fee, outcome)
+                except Exception as exc:
+                    logger.debug(f"Settlement poll error for {trade.ticker}: {exc}")
+
     # ── Start background tasks ───────────────────────────────────────────
-    asyncio.create_task(binance_feed.run(),   name="binance_feed")
-    asyncio.create_task(kalshi_feed.run(),    name="kalshi_feed")
+    asyncio.create_task(binance_feed.run(),          name="binance_feed")
+    asyncio.create_task(market_feed.run(),           name="market_feed")
+    asyncio.create_task(monitor_paper_settlements(), name="settlement_monitor")
 
     # ── Candle buffer for indicator computation ──────────────────────────
     candle_df_rows = []
@@ -161,8 +229,8 @@ async def run_bot(
         if sequence is None:
             continue
 
-        # ── Kalshi market state ──────────────────────────────────────
-        market = kalshi_feed.get_active_market()
+        # ── Market state (simulated or live) ─────────────────────────
+        market = market_feed.get_active_market()
         if market is None:
             logger.debug("No active Kalshi market. Skipping bar.")
             continue
@@ -173,6 +241,16 @@ async def run_bot(
             features=features,
             market_price=market.yes_ask,
             spread=market.spread_yes,
+            strike_type=market.strike_type,
+        )
+
+        # ── Log bar to journal (regardless of trade) ─────────────────
+        bar_id = journal.log_bar(
+            features=features,
+            signal=signal,
+            market=market,
+            btc_close=candle.close,
+            traded=(signal.direction != Direction.NO_TRADE),
         )
 
         if signal.direction == Direction.NO_TRADE:
@@ -187,6 +265,13 @@ async def run_bot(
                 f"slippage={result.slippage:.4f}"
             )
 
+            # ── Journal: log trade ───────────────────────────────────
+            trade_id = journal.log_trade(
+                bar_id=bar_id,
+                result=result,
+                kelly_fraction=getattr(result, "kelly_fraction", 0.0),
+            )
+
             # ── Paper P&L tracking ───────────────────────────────────
             if paper is not None and result.filled > 0:
                 entry = result.avg_fill_price or market.yes_ask
@@ -198,19 +283,9 @@ async def run_bot(
                     expiry_ts=market.expiry_ts,
                     signal_edge=signal.net_edge,
                 )
-                # Schedule settlement check after market expiry
-                async def _settle(pt=paper_trade, mkt=market):
-                    wait = max(0, mkt.expiry_ts - __import__('time').time() + 5)
-                    await asyncio.sleep(wait)
-                    # Fetch final BTC price direction from Kalshi market result
-                    try:
-                        settled_mkt = kalshi._request("GET", f"/markets/{pt.ticker}")
-                        result_val = settled_mkt.get("market", {}).get("result", "")
-                        btc_went_up = result_val.lower() == "yes"
-                        paper.settle_trade(pt, btc_went_up=btc_went_up)
-                    except Exception as exc:
-                        logger.warning(f"Could not fetch settlement for {pt.ticker}: {exc}")
-                asyncio.create_task(_settle())
+                # Store trade_id on paper_trade so settlement monitor can update journal
+                paper_trade._journal_trade_id = trade_id
+                # Settlement handled by monitor_paper_settlements() coroutine
 
 
 def main():

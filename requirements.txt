@@ -9,6 +9,8 @@ torch>=2.3.0
 xgboost>=2.0.3
 scikit-learn>=1.4.0
 optuna>=3.6.0
+shap>=0.45.0
+scipy>=1.13.0
 
 # Data Feeds
 python-binance>=1.0.19
