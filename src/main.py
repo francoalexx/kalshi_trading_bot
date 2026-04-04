@@ -131,7 +131,9 @@ async def run_bot(
     paper = PaperTracker(starting_bankroll=bankroll) if paper_mode else None
 
     # ── Learning system ──────────────────────────────────────────────────
-    journal    = TradeJournal()
+    # Separate DB files so paper and live bots can run simultaneously
+    db_path = Path("data/trade_journal_paper.db") if paper_mode else Path("data/trade_journal.db")
+    journal    = TradeJournal(db_path=db_path)
     heuristics = HeuristicsEngine()
     analyzer   = AttributionAnalyzer(journal)
     postmortem = PostmortemEngine(journal, analyzer)
