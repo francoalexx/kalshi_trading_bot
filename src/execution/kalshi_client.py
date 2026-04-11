@@ -10,9 +10,9 @@ Authentication:
 Endpoints used:
   GET  /markets                — list active BTC Up/Down markets
   GET  /markets/{ticker}/orderbook — order book for a market
-  POST /orders                 — place a new order
-  GET  /orders/{order_id}      — check order status
-  DELETE /orders/{order_id}    — cancel an order
+  POST /portfolio/orders                 — place a new order
+  GET  /portfolio/orders/{order_id}      — check order status
+  DELETE /portfolio/orders/{order_id}    — cancel an order
   GET  /portfolio/balance      — fetch available balance
 
 Configuration (from .env):
@@ -104,25 +104,20 @@ class KalshiClient:
         # Prod requires the full path including version prefix in the signature
         full_path = "/trade-api/v2" + path
         headers = self._sign("GET", full_path)
-        for attempt in range(2):
-            resp = self._session.get(url, headers=headers, params=params, timeout=10)
+        for attempt in range(3):
+            try:
+                resp = self._session.get(url, headers=headers, params=params, timeout=15)
+            except requests.exceptions.Timeout:
+                logger.warning(f"Kalshi GET {path} timed out (attempt {attempt+1}/3). Retrying in 2s...")
+                time.sleep(2.0)
+                continue
             if resp.status_code == 429:
                 logger.warning("Kalshi rate-limited (429) on read. Retrying in 1s...")
-                # Use non-blocking sleep when inside an async event loop,
-                # fall back to blocking sleep for synchronous callers.
-                try:
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    # Can't await here (sync method), but at least yield
-                    # control briefly via a short blocking sleep. The 1s
-                    # pause is unavoidable for retries.
-                except RuntimeError:
-                    pass
                 time.sleep(1.0)
                 continue
             resp.raise_for_status()
             return resp.json()
-        raise RuntimeError(f"Kalshi GET {path} failed after retry.")
+        raise RuntimeError(f"Kalshi GET {path} failed after 3 attempts.")
 
     def _request(
         self,
@@ -136,10 +131,15 @@ class KalshiClient:
         full_path = "/trade-api/v2" + path
         headers = self._sign(method, full_path)
 
-        for attempt in range(2):
-            resp = self._session.request(
-                method, url, headers=headers, params=params, json=json, timeout=10
-            )
+        for attempt in range(3):
+            try:
+                resp = self._session.request(
+                    method, url, headers=headers, params=params, json=json, timeout=15
+                )
+            except requests.exceptions.Timeout:
+                logger.warning(f"Kalshi {method} {path} timed out (attempt {attempt+1}/3). Retrying in 2s...")
+                time.sleep(2.0)
+                continue
             if resp.status_code == 429:
                 logger.warning(f"Kalshi rate-limited (429) on {method} {path}. Retrying in 1s...")
                 time.sleep(1.0)
@@ -147,7 +147,7 @@ class KalshiClient:
             resp.raise_for_status()
             return resp.json()
 
-        raise RuntimeError(f"Kalshi {method} {path} failed after retry.")
+        raise RuntimeError(f"Kalshi {method} {path} failed after 3 attempts.")
 
     # ─── Market Data ─────────────────────────────────────────────────────────
 
@@ -272,7 +272,7 @@ class KalshiClient:
             body["expiration_time"] = expiration_ts
             body["expiration_ts_type"] = "unix_ts"
 
-        result = self._request("POST", "/orders", json=body)
+        result = self._request("POST", "/portfolio/orders", json=body)
         order = result.get("order", result)
         logger.info(
             f"Order placed: {order.get('order_id')} | {side} {count}x {ticker} "
@@ -282,7 +282,7 @@ class KalshiClient:
 
     def get_order(self, order_id: str) -> Dict:
         """Fetch current status of an order."""
-        data = self._request("GET", f"/orders/{order_id}")
+        data = self._request("GET", f"/portfolio/orders/{order_id}")
         return data.get("order", data)
 
     def cancel_order(self, order_id: str) -> Dict:
@@ -290,7 +290,7 @@ class KalshiClient:
         if order_id == "DRY_RUN":
             logger.debug("[DRY RUN] Cancel skipped.")
             return {"order_id": "DRY_RUN", "status": "canceled"}
-        data = self._request("DELETE", f"/orders/{order_id}")
+        data = self._request("DELETE", f"/portfolio/orders/{order_id}")
         order = data.get("order", data)
         logger.info(f"Order cancelled: {order_id} | status={order.get('status')}")
         return order

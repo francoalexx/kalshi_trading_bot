@@ -49,6 +49,7 @@ from src.learning.trade_journal import TradeJournal
 from src.learning.heuristics import HeuristicsEngine
 from src.learning.postmortem import PostmortemEngine
 from src.learning.attribution import AttributionAnalyzer
+from src.learning.shadow_model import ShadowModelManager
 from src.notifications import send_settlement_email
 
 load_dotenv()
@@ -140,8 +141,54 @@ async def run_bot(
     # Inject heuristics engine into alpha so rules fire on every signal
     alpha.heuristics_engine = heuristics
 
+    # ── Shadow model (paper mode only) ───────────────────────────────────
+    # Runs a parallel XGBoost with alternative hyperparameters on every bar.
+    # Never places orders; logs observations to the trade journal so a
+    # statistically-tested promotion candidate is ready to compare against
+    # the live model after enough observations accumulate. Observations
+    # persist across bot restarts via the shadow_observations SQLite table.
+    shadow_mgr: Optional[ShadowModelManager] = None
+    if paper_mode:
+        shadow_mgr = ShadowModelManager(
+            live_model_path=xgb_model_path,
+            # Candidate params: deeper trees + slower learning rate vs. the
+            # live model's defaults. First principled A/B experiment — change
+            # these once Optuna starts feeding real candidates.
+            candidate_params={
+                "max_depth":     6,
+                "learning_rate": 0.03,
+                "n_estimators":  300,
+                "subsample":     0.85,
+            },
+            # Slightly wider confidence band than live (0.55/0.45) to test
+            # whether stricter entry raises win rate enough to offset lower
+            # trade frequency.
+            xgb_yes_thresh=0.56,
+            xgb_no_thresh=0.44,
+            journal=journal,
+        )
+        if not shadow_mgr.train_from_parquet("data/btc_1m.parquet"):
+            logger.warning(
+                "Shadow model failed to train from parquet. "
+                "Paper run will continue without shadow observations."
+            )
+            shadow_mgr = None
+        else:
+            stats = journal.get_shadow_stats()
+            logger.info(
+                f"Shadow model active. Existing observations in journal: "
+                f"{stats['n_observations']:,} "
+                f"(would-trade: {stats['n_would_trade']:,}, "
+                f"settled: {stats['n_settled']:,}, "
+                f"win_rate: {stats['shadow_win_rate']:.1%})"
+            )
+
     # ── Unified pending-trade list (paper + live) ────────────────────────
     pending_trades: List[PendingTrade] = []
+    # Tickers with an unsettled trade already placed. Prevents the bot from
+    # stacking multiple orders on the same 15-min expiry (see Lessons Learned:
+    # "Same-market stacking" 2026-04-10).
+    traded_tickers: set = set()
 
     # ── SIGINT handler → graceful kill switch ────────────────────────────
     def _handle_sigint(sig, frame):
@@ -186,10 +233,49 @@ async def run_bot(
                         )
                         won = (pt.side == result)
                         _settle_trade(pt, won=won)
+                        # Update any shadow observations tied to this market.
+                        if shadow_mgr is not None:
+                            n = shadow_mgr.record_settlement(pt.ticker, result)
+                            if n > 0:
+                                logger.debug(
+                                    f"Shadow: settled {n} observation(s) for {pt.ticker}"
+                                )
                 except Exception as exc:
                     logger.debug(
                         f"Settlement poll error for {pt.ticker}: {exc}"
                     )
+
+            # ── Shadow-only sweep ───────────────────────────────────────
+            # Many shadow observations sit on markets where live did not
+            # trade. Sweep them here: find distinct expired tickers with
+            # unsettled shadow rows and fetch each result once.
+            if shadow_mgr is not None:
+                try:
+                    rows = journal._conn.execute(
+                        """
+                        SELECT DISTINCT market_ticker
+                        FROM shadow_observations
+                        WHERE settled = 0
+                          AND expiry_ts IS NOT NULL
+                          AND expiry_ts < ?
+                        LIMIT 25
+                        """,
+                        (now,),
+                    ).fetchall()
+                    for r in rows:
+                        ticker = r["market_ticker"]
+                        if not ticker:
+                            continue
+                        try:
+                            result = _fetch_market_result(ticker)
+                            if result in ("yes", "no"):
+                                shadow_mgr.record_settlement(ticker, result)
+                        except Exception as exc:
+                            logger.debug(
+                                f"Shadow sweep poll error for {ticker}: {exc}"
+                            )
+                except Exception as exc:
+                    logger.debug(f"Shadow sweep query error: {exc}")
 
     def _fetch_market_result(ticker: str) -> str:
         """Fetch and normalise the market result from Kalshi API."""
@@ -228,6 +314,8 @@ async def run_bot(
         outcome = "WIN" if won else "LOSS"
 
         pt.settled = True
+        # Release the per-ticker dedup slot so the next expiry can trade.
+        traded_tickers.discard(pt.ticker)
 
         # ── Paper tracker (paper mode) ───────────────────────────────
         if paper is not None and pt.paper_trade is not None:
@@ -235,6 +323,9 @@ async def run_bot(
                 pt.paper_trade,
                 pt.side if won else ("no" if pt.side == "yes" else "yes"),
             )
+
+        # ── Release position slot now that market has settled ─────────
+        risk.register_order_closed(pt.contracts, pt.entry_price)
 
         # ── Risk manager update (both modes) ─────────────────────────
         risk.record_settlement(
@@ -267,6 +358,9 @@ async def run_bot(
             f"bankroll=${risk.bankroll:.2f}"
         )
 
+    # Track all settled trades for cumulative email dashboard
+    settled_history: List[object] = []
+
     def _send_live_email(pt: PendingTrade, won: bool, pnl: float, fee: float):
         """Send email notification for live trade settlement."""
         from types import SimpleNamespace
@@ -280,13 +374,14 @@ async def run_bot(
             pnl=pnl,
             fee=fee,
         )
+        settled_history.append(current)
 
         try:
             send_settlement_email(
                 trade=current,
                 bankroll=risk.bankroll,
                 start_bankroll=bankroll,
-                settled_trades=[current],
+                settled_trades=settled_history,
             )
         except Exception as exc:
             logger.warning(f"Email notification failed: {exc}")
@@ -381,7 +476,34 @@ async def run_bot(
             traded=(signal.direction != Direction.NO_TRADE),
         )
 
+        # ── Shadow model observation ─────────────────────────────────
+        # Run the shadow model on the same bar, regardless of whether
+        # live will trade. The observation — and its eventual outcome —
+        # is persisted to the journal via log_shadow_observation().
+        if shadow_mgr is not None:
+            try:
+                shadow_mgr.record_bar(
+                    bar_id=bar_id,
+                    market=market,
+                    features=features,
+                    live_prob=signal.xgb_prob,
+                    live_direction=signal.direction.value,
+                )
+            except Exception as exc:
+                logger.debug(f"Shadow record_bar error: {exc}")
+
         if signal.direction == Direction.NO_TRADE:
+            continue
+
+        # ── Per-market dedup ────────────────────────────────────────
+        # Never place more than one trade per market expiry. Averaging
+        # into a losing position is the single largest source of drawdown
+        # on live (see Lessons Learned: "Same-market stacking" 2026-04-10).
+        if market.ticker in traded_tickers:
+            logger.debug(
+                f"Skipping {market.ticker}: already have an unsettled trade "
+                f"on this expiry."
+            )
             continue
 
         # ── Execution ────────────────────────────────────────────────
@@ -426,6 +548,7 @@ async def run_bot(
                     pt.paper_trade = paper_trade
 
                 pending_trades.append(pt)
+                traded_tickers.add(result.ticker)
                 # Settlement handled by monitor_settlements() coroutine
 
 

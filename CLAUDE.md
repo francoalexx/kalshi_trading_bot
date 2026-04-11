@@ -68,16 +68,17 @@ PromotionOrchestrator → Mann-Whitney gate (p<0.05) → auto-promote or revert
 | Bankroll | $500 | `INITIAL_BANKROLL` (.env) |
 | Max position | 5% bankroll | `MAX_POSITION_PCT` (.env) |
 | Daily loss limit | 10% | `DAILY_LOSS_LIMIT_PCT` (.env) |
-| Max open positions | 5 | `MAX_OPEN_POSITIONS` (.env) |
-| Max trades/hour | 20 | `MAX_TRADES_PER_HOUR` (.env) |
+| Max open positions | 3 | `MAX_OPEN_POSITIONS` (.env) |
+| Max trades/hour | 8 | `MAX_TRADES_PER_HOUR` (.env) |
 | Min net edge | 1% | `MIN_NET_EDGE` (.env) |
-| **XGB YES threshold** | **0.54** | hardcoded in alpha.py |
-| **XGB NO threshold** | **0.46** | hardcoded in alpha.py |
+| **XGB YES threshold** | **0.55** | hardcoded in alpha.py |
+| **XGB NO threshold** | **0.45** | hardcoded in alpha.py |
 | CNN YES/NO threshold | 0.50 | hardcoded in alpha.py |
-| **OTM guard LOW** | **0.15** | hardcoded in alpha.py |
-| **OTM guard HIGH** | **0.85** | hardcoded in alpha.py |
-| **Feed ATM reject LOW** | **0.15** | hardcoded in kalshi_feed.py |
-| **Feed ATM reject HIGH** | **0.85** | hardcoded in kalshi_feed.py |
+| **OTM guard LOW** | **0.30** | hardcoded in alpha.py |
+| **OTM guard HIGH** | **0.70** | hardcoded in alpha.py |
+| **Feed ATM reject LOW** | **0.30** | hardcoded in kalshi_feed.py |
+| **Feed ATM reject HIGH** | **0.70** | hardcoded in kalshi_feed.py |
+| **Per-market dedup** | **1 trade/expiry** | main.py `traded_tickers` set |
 | Cancel deadline | T−90s | hardcoded in controller.py |
 | Analysis interval | 50 trades | `ANALYSIS_INTERVAL` (.env) |
 | Shadow min trades | 50 | `SHADOW_MIN_TRADES` (.env) |
@@ -256,6 +257,23 @@ Fix: added both fields to `OrderResult`, populated from `signal` and `_kelly_siz
 in `controller.py`. `_kelly_size()` now returns `(position_usd, f_half)` tuple.
 Failure classifications will be meaningful from trade #119 onward.
 
+### MAX_OPEN_POSITIONS was inert — 7 trades on one settlement (fixed 2026-04-06)
+**What happened:** Live bot placed 7 trades on the same 15-min market window
+despite `MAX_OPEN_POSITIONS` being set to 4–6. All 7 settled at 5:30 PM.
+
+**Root cause:** `register_order_closed()` was called when the **order filled**,
+not when the **market settled**. Since Kalshi limit orders fill in seconds but
+markets settle 15 minutes later, `_open_positions` was always near 0. The
+`allow_trade()` check (`_open_positions >= _max_open`) never blocked anything.
+
+**Fix:** Removed `register_order_closed()` from `controller.py` order-fill paths.
+The position slot is now released only at settlement time in `_settle_trade()`
+(`main.py`). Exception: if an order fills zero contracts (fully cancelled), the
+slot is released immediately since there is nothing to settle.
+
+**Rule:** `_open_positions` must track **position lifecycle** (place → settle),
+not **order lifecycle** (place → fill). Never decrement at fill time.
+
 ### Console log level raised to INFO (2026-04-04)
 `src/main.py` stderr logger changed from `DEBUG` to `INFO`. Debug-level candle
 and market-poll messages now go to the log file only. Console shows trades,
@@ -282,9 +300,112 @@ email notifications.
 triggered because `"demo"` is truthy. Fixed by changing default to `None`.
 Also fixed `diagnose.py` to pass `env` explicitly.
 
+### Retrained on 2024-2026 data — fixed directional bias (2026-04-10)
+**What happened:** Original XGBoost was trained only on 2024 data (`data/btc_1m.parquet`
+was Jan 1 – Dec 31 2024). By April 2026 that training set was 15 months stale
+and did not see any of 2025 or the 2026 BTC bull run. Live symptom: on Apr 10
+the bot fired **17 consecutive BUY_YES signals, zero BUY_NO**, while BTC's
+15-min direction was actually mixed — the old model had learned a 2024 bull
+bias and couldn't fire NO.
+
+**Verification (30-day validation, Mar 10 – Apr 9 2026):**
+
+| Threshold band | OLD (2024) WR | NEW (2024-2026) WR |
+|---|---|---|
+| `(0.46, 0.54)` | 54.6% (354 NO / 4512 YES — 7% NO) | 54.2% (7549 NO / 6007 YES — 56% NO) |
+| `(0.45, 0.55)` | 51.3% | **59.7%** |
+| `(0.42, 0.58)` | **31.8%** (inversely calibrated!) | **75.9%** |
+
+The old model's high-confidence signals on 2026 data were *worse than random*,
+a textbook distribution-shift failure. New model fires balanced NO/YES and
+hits 59.7% WR at the new `(0.45, 0.55)` thresholds — well above the 53.5%
+fee breakeven.
+
+**Fix:**
+- Downloaded fresh data: `python -m src.data.historical_downloader --start 2024-01-01 --end 2026-04-10 --output data/btc_1m.parquet` (1.2M candles)
+- Retrained: `python -m src.models.train --data data/btc_1m.parquet --output models/artifacts/ --epochs 50 --trials 50`
+- Old models preserved as `xgboost_prev.pkl` / `cnn_lstm_prev.pt`
+- Thresholds moved `0.54/0.46` → `0.55/0.45` to hit the new sweet spot
+- CNN-LSTM also retrained but still near-random (val_acc 0.5338) — still just a "doesn't disagree" gate
+
+**Rule:** Schedule a full retrain whenever the training data is more than
+~6 months stale. The distribution-shift failure mode is silent: accuracy
+looks normal, but the directional distribution of signals becomes skewed
+and high-confidence calibration inverts.
+
+### Same-market stacking — averaging into losing trades (fixed 2026-04-10)
+**What happened:** Apr 10 live run hit 11.8% win rate (2 wins / 17 trades) and
+−$768 PnL on a $1,200 bankroll. Post-mortem of the log showed the bot placing
+**3 trades on the same 15-min expiry in consecutive bars** as BTC moved against
+the position. Example: `KXBTC15M-26APR100630-30` → BUY YES at 33¢, then 30¢,
+then 17¢ over 3 minutes. All three settled LOSS simultaneously (−$185).
+
+**Root cause:** `gross_edge = p_yes − market_price`. When BTC moves against the
+model's direction, the YES ask falls. That makes the *apparent* edge **grow**,
+so the bot interprets the move-against as a **stronger** signal and averages
+into the losing position. `MAX_OPEN_POSITIONS` does not block this — it caps
+*total* open positions across all markets, not per-expiry. Three trades on one
+expiry is a 3× leveraged bet that all wins or all loses.
+
+**Fix:** `main.py` now maintains a `traded_tickers: set[str]` of unsettled
+tickers. The main loop skips the signal if `market.ticker in traded_tickers`;
+the set is populated when `pending_trades.append(pt)` runs and cleared inside
+`_settle_trade()`. **Rule:** at most one open position per market expiry, period.
+
+### OTM guard tightened 0.15 → 0.30 (2026-04-10)
+Live entry-price distribution (Apr 5–10): `<0.30` bucket had 21% win rate
+(8W/38L, −$453). `0.30–0.40`: 39%. `0.40–0.60`: 47%. The original `0.15` floor
+was too loose — the model's P(direction) still isn't a reliable proxy for
+P(YES wins) at 17¢–29¢. Both guards now use `[0.30, 0.70]`:
+- `alpha.py`: `OTM_LOW = 0.30`, `OTM_HIGH = 0.70`
+- `kalshi_feed.py`: `OTM_REJECT_LOW = 0.30`, `OTM_REJECT_HIGH = 0.70`, and
+  check `yes_ask` (the price the bot actually pays) instead of `mid_yes` so
+  the two guards agree.
+
+### DAILY_LOSS_LIMIT_PCT was 0.30 (fixed 2026-04-10)
+`.env` had `DAILY_LOSS_LIMIT_PCT=0.30` — the kill switch only fired after a
+30% bankroll drop. On Apr 10 the bot reached −30.45% before the switch tripped
+post-settlement. Lowered to `0.10` to match the CLAUDE.md spec and cap single-day
+drawdown at 10%.
+
 ### Live mode credential validation (added 2026-04-04)
 Bot now exits with a clear error if started in live mode without a valid Kalshi
 private key, instead of silently entering DRY_RUN mode where orders are faked.
+
+### Shadow model wired into paper mode (added 2026-04-10)
+**What changed:** `ShadowModelManager` now runs during `--paper` only. On every
+bar it predicts with an alternate XGBoost (bootstrapped from `data/btc_1m.parquet`
+via new `train_from_parquet()` method) and writes an observation row to a new
+`shadow_observations` SQLite table. On market settlement, `settle_shadow_observations()`
+updates every row for that ticker with `shadow_win` and per-contract `shadow_pnl`.
+
+**Key design points:**
+- **Persistence across restarts** — observations live in the trade journal DB
+  (`data/trade_journal_paper.db`), so a 24-hour paper run followed by a stop
+  loses nothing. The next run keeps accumulating on top.
+- **Shadow-only sweep** — the settlement monitor also polls Kalshi for expired
+  tickers with unsettled shadow rows but no live trade, so observations on
+  bars where the live bot abstained still get settled.
+- **Candidate params** — default shadow config is `max_depth=6, lr=0.03,
+  n_estimators=300, subsample=0.85`, thresholds `0.56/0.44` (wider than live's
+  `0.55/0.45`). First A/B test: "would deeper trees + stricter thresholds
+  beat the current config?" Swap these out once Optuna starts feeding real
+  candidates.
+- **Live mode untouched** — shadow_mgr stays `None` in live mode; zero overhead
+  on the real-money path.
+
+**New files/methods:**
+- `TradeJournal.log_shadow_observation()` / `settle_shadow_observations()` /
+  `get_shadow_stats()`
+- `ShadowModelManager.train_from_parquet()` / `predict_decision()` /
+  `record_bar()` / `record_settlement()`
+- `shadow_observations` table with index on `(market_ticker, settled)`
+
+**Query the shadow stats:**
+```python
+from src.learning.trade_journal import TradeJournal
+print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
+```
 
 ---
 
@@ -351,6 +472,7 @@ private key, instead of silently entering DRY_RUN mode where orders are faked.
 - [x] Live mode credential validation (exits if no private key)
 - [x] KalshiClient env parameter bug fix (KALSHI_ENV now respected)
 - [x] Paper run complete — 124 trades (56.5% win rate, +$2,082 net from $500)
+- [x] Shadow model wired into paper mode with SQLite-backed observation log
 
 ### 🔄 In Progress
 - [ ] First live trading run — $100 bankroll on prod (started 2026-04-04)

@@ -94,6 +94,30 @@ def _init_db(conn: sqlite3.Connection) -> None:
         n_trades_basis   INTEGER,
         p_value          REAL
     );
+
+    CREATE TABLE IF NOT EXISTS shadow_observations (
+        obs_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        bar_id              INTEGER REFERENCES bars(bar_id),
+        ts                  REAL,
+        market_ticker       TEXT,
+        expiry_ts           REAL,
+        market_yes_ask      REAL,
+        market_spread       REAL,
+        strike_type         TEXT,
+        live_prob           REAL,
+        shadow_prob         REAL,
+        live_direction      TEXT,
+        shadow_direction    TEXT,
+        would_trade_live    INTEGER,
+        would_trade_shadow  INTEGER,
+        settled             INTEGER DEFAULT 0,
+        market_result       TEXT,
+        shadow_win          INTEGER,
+        shadow_pnl          REAL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_shadow_ticker   ON shadow_observations(market_ticker);
+    CREATE INDEX IF NOT EXISTS idx_shadow_settled  ON shadow_observations(settled);
     """)
     conn.commit()
 
@@ -304,3 +328,135 @@ class TradeJournal:
             "SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL"
         ).fetchone()
         return row[0] if row else 0
+
+    # ── Shadow model observation logging ─────────────────────────────────
+
+    def log_shadow_observation(
+        self,
+        bar_id: int,
+        market_ticker: str,
+        expiry_ts: float,
+        market_yes_ask: float,
+        market_spread: float,
+        strike_type: str,
+        live_prob: float,
+        shadow_prob: float,
+        live_direction: str,
+        shadow_direction: str,
+        would_trade_live: bool,
+        would_trade_shadow: bool,
+    ) -> int:
+        """Write one shadow-model observation to the journal."""
+        cur = self._conn.execute(
+            """
+            INSERT INTO shadow_observations (
+                bar_id, ts, market_ticker, expiry_ts,
+                market_yes_ask, market_spread, strike_type,
+                live_prob, shadow_prob,
+                live_direction, shadow_direction,
+                would_trade_live, would_trade_shadow
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                bar_id, time.time(), market_ticker, expiry_ts,
+                market_yes_ask, market_spread, strike_type,
+                live_prob, shadow_prob,
+                live_direction, shadow_direction,
+                int(would_trade_live), int(would_trade_shadow),
+            ),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def settle_shadow_observations(self, market_ticker: str, market_result: str) -> int:
+        """
+        Mark all shadow observations for a given market as settled.
+
+        shadow_win = 1 if shadow_direction matches market_result, else 0.
+        shadow_pnl = per-contract P&L (net of Kalshi fee) if shadow would have
+                     traded, else 0. Uses market_yes_ask as entry price.
+
+        Returns the number of rows updated.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT obs_id, shadow_direction, would_trade_shadow, market_yes_ask
+            FROM shadow_observations
+            WHERE market_ticker = ? AND settled = 0
+            """,
+            (market_ticker,),
+        ).fetchall()
+
+        updated = 0
+        for row in rows:
+            obs_id = row["obs_id"]
+            sdir = (row["shadow_direction"] or "").upper()
+            would = bool(row["would_trade_shadow"])
+            entry = row["market_yes_ask"] or 0.5
+
+            if not would or sdir == "NO_TRADE":
+                shadow_win = None
+                shadow_pnl = 0.0
+            else:
+                # Shadow side: BUY_YES → wins on "yes", BUY_NO → wins on "no"
+                won = (
+                    (sdir == "BUY_YES" and market_result == "yes") or
+                    (sdir == "BUY_NO"  and market_result == "no")
+                )
+                shadow_win = 1 if won else 0
+                # Per-contract P&L at entry price, net of Kalshi fee
+                fee = 0.07 * entry * (1 - entry)
+                if won:
+                    shadow_pnl = (1.0 - entry) - fee
+                else:
+                    shadow_pnl = -entry - fee
+
+            self._conn.execute(
+                """
+                UPDATE shadow_observations
+                SET settled = 1, market_result = ?, shadow_win = ?, shadow_pnl = ?
+                WHERE obs_id = ?
+                """,
+                (market_result, shadow_win, shadow_pnl, obs_id),
+            )
+            updated += 1
+
+        if updated:
+            self._conn.commit()
+        return updated
+
+    def get_shadow_stats(self) -> Dict[str, float]:
+        """Return summary stats for the shadow model observations table."""
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM shadow_observations"
+        ).fetchone()[0]
+        would_trade = self._conn.execute(
+            "SELECT COUNT(*) FROM shadow_observations WHERE would_trade_shadow = 1"
+        ).fetchone()[0]
+        settled_trades = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM shadow_observations
+            WHERE would_trade_shadow = 1 AND settled = 1
+            """
+        ).fetchone()[0]
+        wins = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM shadow_observations
+            WHERE would_trade_shadow = 1 AND shadow_win = 1
+            """
+        ).fetchone()[0]
+        total_pnl_row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(shadow_pnl), 0.0) FROM shadow_observations
+            WHERE would_trade_shadow = 1 AND settled = 1
+            """
+        ).fetchone()
+        total_pnl = float(total_pnl_row[0]) if total_pnl_row else 0.0
+
+        return {
+            "n_observations":  total,
+            "n_would_trade":   would_trade,
+            "n_settled":       settled_trades,
+            "shadow_win_rate": (wins / settled_trades) if settled_trades else 0.0,
+            "shadow_total_pnl_per_contract": total_pnl,
+        }

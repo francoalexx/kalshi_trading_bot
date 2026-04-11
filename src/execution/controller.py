@@ -36,6 +36,43 @@ FILL_POLL_SECONDS = 5
 CANCEL_BEFORE_EXPIRY = 90  # cancel any unfilled order this many seconds before expiry
 
 
+def _parse_fill_count(order: dict) -> int:
+    """Extract filled contract count from Kalshi order response.
+
+    Kalshi v2 API uses 'fill_count_fp' (string like "11.00") instead of
+    'filled_count' (int). Try the new field first, fall back to legacy.
+    """
+    fp = order.get("fill_count_fp")
+    if fp is not None:
+        return int(float(fp))
+    return int(order.get("filled_count", 0))
+
+
+def _parse_remaining(order: dict) -> int:
+    """Extract remaining contract count from Kalshi order response."""
+    fp = order.get("remaining_count_fp")
+    if fp is not None:
+        return int(float(fp))
+    return int(order.get("remaining_count", 0))
+
+
+def _parse_fill_price(order: dict, side: str) -> Optional[float]:
+    """Extract fill price (0-1 scale) from Kalshi order response.
+
+    Kalshi v2 uses 'yes_price_dollars'/'no_price_dollars' (string like "0.4400")
+    instead of 'yes_price'/'no_price' (int cents).
+    """
+    dollars_key = f"{side}_price_dollars"
+    dollars = order.get(dollars_key)
+    if dollars is not None:
+        return float(dollars)
+    cents_key = f"{side}_price"
+    cents = order.get(cents_key)
+    if cents is not None:
+        return cents / 100 if cents > 1 else cents
+    return None
+
+
 @dataclass
 class OrderResult:
     order_id:       str
@@ -148,7 +185,8 @@ class ExecutionController:
                 signal_edge=signal.net_edge,
                 kelly_fraction=kelly_fraction,
             )
-            self._risk.register_order_closed(result.filled, result.avg_fill_price)
+            # Do NOT call register_order_closed() here — position stays
+            # "open" until settlement so MAX_OPEN_POSITIONS is enforced.
             return result
 
         order = self._client.place_order(
@@ -159,6 +197,34 @@ class ExecutionController:
             expiration_ts=int(market.expiry_ts) - 5,  # expire 5s before market expiry
         )
         order_id = order.get("order_id", "UNKNOWN")
+        order_status = order.get("status", "")
+
+        # If Kalshi filled the order immediately, skip monitoring
+        if order_status in ("executed", "filled"):
+            fill_count = _parse_fill_count(order)
+            avg_fill = _parse_fill_price(order, side) or limit_float
+            slippage = avg_fill - limit_float
+            logger.info(
+                f"Order {order_id} filled immediately: {fill_count}/{contracts} "
+                f"@ {avg_fill:.3f} slippage={slippage:.4f}"
+            )
+            result = OrderResult(
+                order_id=order_id,
+                ticker=market.ticker,
+                side=side,
+                contracts=contracts,
+                limit_price=limit_float,
+                filled=fill_count,
+                avg_fill_price=avg_fill,
+                slippage=slippage,
+                cancelled=False,
+                outcome_ts=market.expiry_ts,
+                signal_edge=signal.net_edge,
+                kelly_fraction=kelly_fraction,
+            )
+            # Do NOT call register_order_closed() here — position stays
+            # "open" until settlement so MAX_OPEN_POSITIONS is enforced.
+            return result
 
         # ── Monitor fill until T-90s deadline ────────────────────────────
         result = await self._monitor_fill(
@@ -170,7 +236,10 @@ class ExecutionController:
             expiry_ts=market.expiry_ts,
         )
 
-        self._risk.register_order_closed(result.filled, result.avg_fill_price or 0.0)
+        # If order was cancelled with zero fills, release the position slot
+        # immediately (nothing to settle). Otherwise keep it open until settlement.
+        if result.filled == 0:
+            self._risk.register_order_closed(0, 0.0)
         return result
 
     # ─── Position Sizing ─────────────────────────────────────────────────────
@@ -228,7 +297,7 @@ class ExecutionController:
                 # Cancel stale order before market expires
                 try:
                     cancelled_order = self._client.cancel_order(order_id)
-                    remaining = cancelled_order.get("remaining_count", 0)
+                    remaining = _parse_remaining(cancelled_order)
                     filled_now = contracts - remaining
                     filled += filled_now
                     cancelled = True
@@ -237,7 +306,17 @@ class ExecutionController:
                         f"filled={filled}/{contracts}"
                     )
                 except Exception as exc:
-                    logger.error(f"Cancel failed for {order_id}: {exc}")
+                    # 404 means order already filled/expired — check final status
+                    logger.warning(f"Cancel failed for {order_id}: {exc}")
+                    try:
+                        order = self._client.get_order(order_id)
+                        filled = _parse_fill_count(order) or filled
+                        logger.info(
+                            f"Order {order_id} already terminal: "
+                            f"status={order.get('status')} filled={filled}/{contracts}"
+                        )
+                    except Exception:
+                        pass
                 break
 
             # Check fill status
@@ -248,14 +327,15 @@ class ExecutionController:
                 continue
 
             status = order.get("status", "")
-            new_fills = order.get("filled_count", 0) - filled
+            current_filled = _parse_fill_count(order)
+            new_fills = current_filled - filled
             if new_fills > 0:
-                fill_price = order.get("yes_price" if side == "yes" else "no_price", 0) / 100
+                fill_price = _parse_fill_price(order, side) or limit_float
                 fill_prices.extend([fill_price] * new_fills)
-                filled = order.get("filled_count", 0)
+                filled = current_filled
                 logger.debug(f"Fill update: {filled}/{contracts} @ {fill_price:.3f}")
 
-            if status in ("filled", "canceled", "expired"):
+            if status in ("executed", "filled", "canceled", "expired"):
                 logger.info(
                     f"Order {order_id} terminal status={status} filled={filled}/{contracts}"
                 )

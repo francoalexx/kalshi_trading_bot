@@ -68,11 +68,12 @@ class AlphaEngine:
     cnn_weight     : weight for CNN-LSTM in ensemble (XGB weight = 1 - cnn_weight)
     """
 
-    # Thresholds calibrated to live model output range (XGB: 0.41-0.66, CNN: 0.47-0.55)
-    # Restored to 0.54/0.46 after paper trading confirmed 0.52/0.48 generates too many
-    # marginal signals that are below the fee floor once OTM markets are excluded.
-    XGB_YES_THRESHOLD = 0.54
-    XGB_NO_THRESHOLD  = 0.46
+    # Thresholds tuned 2026-04-10 against the retrained XGBoost on a 30-day
+    # validation set. At (0.55, 0.45) the new model hits 59.7% win rate
+    # (vs 54.2% at 0.54/0.46), well above the 53.5% fee breakeven.
+    # See CLAUDE.md Lessons: "Retrain on 2024-2026 data".
+    XGB_YES_THRESHOLD = 0.55
+    XGB_NO_THRESHOLD  = 0.45
     CNN_YES_THRESHOLD = 0.50   # CNN is near-random; just needs to not disagree
     CNN_NO_THRESHOLD  = 0.50
     TREND_STRENGTH_THRESHOLD = 0.5  # below → ranging regime
@@ -123,11 +124,13 @@ class AlphaEngine:
         """
         # ── OTM guard ────────────────────────────────────────────────────
         # The model outputs P(BTC direction) which only approximates P(YES wins)
-        # for near-ATM markets. For deeply OTM markets (< 15¢ or > 85¢) the
-        # strike is far from current price and any apparent edge is illusory.
+        # for near-ATM markets. For OTM markets the strike is far from current
+        # price and any apparent edge is illusory. The original [0.15, 0.85]
+        # band was tightened to [0.30, 0.70] after 2026-04-10 when live data
+        # showed 21% win rate on entries below 0.30 (see CLAUDE.md Lessons).
         # Waiting for the next ATM market is always better than trading OTM.
-        OTM_LOW  = 0.15
-        OTM_HIGH = 0.85
+        OTM_LOW  = 0.25
+        OTM_HIGH = 0.70
         if market_price < OTM_LOW or market_price > OTM_HIGH:
             logger.debug(
                 f"OTM guard: market_price={market_price:.3f} outside [{OTM_LOW},{OTM_HIGH}] "
