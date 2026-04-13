@@ -50,6 +50,7 @@ from src.learning.heuristics import HeuristicsEngine
 from src.learning.postmortem import PostmortemEngine
 from src.learning.attribution import AttributionAnalyzer
 from src.learning.shadow_model import ShadowModelManager
+from src.data.kalshi_price_logger import KalshiPriceLogger
 from src.notifications import send_settlement_email
 
 load_dotenv()
@@ -64,7 +65,7 @@ logger.add("logs/bot_{time:YYYY-MM-DD}.log", level="DEBUG", rotation="00:00")
 
 @dataclass
 class PendingTrade:
-    """Tracks an open trade awaiting settlement (paper or live)."""
+    """Tracks an open trade awaiting settlement or scalp exit (paper or live)."""
     ticker:            str
     side:              str        # "yes" or "no"
     contracts:         int
@@ -74,6 +75,12 @@ class PendingTrade:
     journal_trade_id:  Optional[int] = None
     paper_trade:       object = None   # PaperTrade (paper mode only)
     settled:           bool = False
+    # Scalp-mode fields (unused in settlement mode)
+    mode:              str = "settlement"   # "settlement" or "scalp"
+    exit_price:        Optional[float] = None
+    exit_ts:           Optional[float] = None
+    sell_order_id:     Optional[str] = None
+    sell_fee:          float = 0.0
 
 
 SETTLEMENT_POLL_INTERVAL = 30   # seconds between settlement checks
@@ -90,6 +97,7 @@ async def run_bot(
     daily_loss_pct  = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.10"))
     max_tph         = int(os.getenv("MAX_TRADES_PER_HOUR", "20"))
     min_edge        = float(os.getenv("MIN_NET_EDGE", "0.01"))
+    max_edge        = float(os.getenv("MAX_NET_EDGE", "0.10"))
 
     # ── Component initialisation ─────────────────────────────────────────
     risk = RiskManager(
@@ -120,6 +128,7 @@ async def run_bot(
         cnn_lstm_path=cnn_model_path,
         xgb_path=xgb_model_path,
         min_net_edge=min_edge,
+        max_net_edge=max_edge,
     )
 
     controller = ExecutionController(
@@ -189,6 +198,11 @@ async def run_bot(
     # stacking multiple orders on the same 15-min expiry (see Lessons Learned:
     # "Same-market stacking" 2026-04-10).
     traded_tickers: set = set()
+    # Tickers where a "too good to be true" signal fired. Once tainted, the
+    # bot skips the ticker for its entire lifecycle — the model-market
+    # disagreement doesn't go away just because market_price moves closer
+    # to p_yes (see 2026-04-13 session notes).
+    tainted_tickers: set = set()
 
     # ── SIGINT handler → graceful kill switch ────────────────────────────
     def _handle_sigint(sig, frame):
@@ -316,6 +330,7 @@ async def run_bot(
         pt.settled = True
         # Release the per-ticker dedup slot so the next expiry can trade.
         traded_tickers.discard(pt.ticker)
+        tainted_tickers.discard(pt.ticker)
 
         # ── Paper tracker (paper mode) ───────────────────────────────
         if paper is not None and pt.paper_trade is not None:
@@ -386,10 +401,20 @@ async def run_bot(
         except Exception as exc:
             logger.warning(f"Email notification failed: {exc}")
 
+    # ── Contract price logger (runs in all modes to collect scalp training data)
+    scalp_poll = float(os.getenv("SCALP_POLL_INTERVAL", "5"))
+    price_logger = KalshiPriceLogger(
+        kalshi_client=kalshi,
+        binance_feed=binance_feed,
+        db_path=Path("data/contract_prices.db"),
+        poll_interval=scalp_poll,
+    )
+
     # ── Start background tasks ───────────────────────────────────────────
     asyncio.create_task(binance_feed.run(),       name="binance_feed")
     asyncio.create_task(market_feed.run(),        name="market_feed")
     asyncio.create_task(monitor_settlements(),    name="settlement_monitor")
+    asyncio.create_task(price_logger.run(),       name="price_logger")
 
     # ── Candle buffer for indicator computation ──────────────────────────
     candle_df_rows = []
@@ -492,7 +517,18 @@ async def run_bot(
             except Exception as exc:
                 logger.debug(f"Shadow record_bar error: {exc}")
 
+        # ── TGTBT taint tracking ────────────────────────────────────
+        if signal.tgtbt_filtered:
+            tainted_tickers.add(market.ticker)
+
         if signal.direction == Direction.NO_TRADE:
+            continue
+
+        if market.ticker in tainted_tickers:
+            logger.info(
+                f"Skipping {market.ticker}: previously flagged as 'too good "
+                f"to be true' — model-market disagreement is structural."
+            )
             continue
 
         # ── Per-market dedup ────────────────────────────────────────

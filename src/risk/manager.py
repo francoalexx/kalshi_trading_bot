@@ -161,10 +161,11 @@ class RiskManager:
             self._daily.losses          += (1 if gross_pnl <= 0 else 0)
             self._bankroll              += gross_pnl
 
+            daily_pct = self._daily.realized_pnl / self._daily.start_bankroll if self._daily.start_bankroll else 0.0
             logger.info(
                 f"Settlement: pnl={gross_pnl:+.2f} | fees={fees_paid:.2f} | "
                 f"bankroll=${self._bankroll:.2f} | daily_pnl={self._daily.realized_pnl:+.2f} "
-                f"({self._daily.daily_loss_pct:.2%} of day start)"
+                f"({daily_pct:+.2%} of day start)"
             )
 
             # Re-check daily loss after settlement

@@ -244,15 +244,19 @@ class KalshiClient:
         count: int,          # number of contracts
         limit_price: int,    # cents (1–99)
         expiration_ts: Optional[int] = None,  # unix seconds; None = GTC
+        action: str = "buy",  # "buy" or "sell"
     ) -> Dict:
         """
-        Place a limit order.
+        Place a limit order (buy or sell).
 
         Returns the Kalshi order object with fields:
             order_id, status, filled_count, remaining_count, etc.
         """
+        if action not in ("buy", "sell"):
+            raise ValueError(f"action must be 'buy' or 'sell', got '{action}'")
+
         if self._private_key is None:
-            logger.warning(f"[DRY RUN] Would place: {side} {count}x {ticker} @ {limit_price}¢")
+            logger.warning(f"[DRY RUN] Would {action.upper()}: {side} {count}x {ticker} @ {limit_price}¢")
             return {
                 "order_id": "DRY_RUN",
                 "status": "resting",
@@ -262,7 +266,7 @@ class KalshiClient:
 
         body: Dict[str, Any] = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action,
             "side":   side,
             "count":  count,
             "type":   "limit",
@@ -275,7 +279,7 @@ class KalshiClient:
         result = self._request("POST", "/portfolio/orders", json=body)
         order = result.get("order", result)
         logger.info(
-            f"Order placed: {order.get('order_id')} | {side} {count}x {ticker} "
+            f"Order placed: {order.get('order_id')} | {action.upper()} {side} {count}x {ticker} "
             f"@ {limit_price}¢ | status={order.get('status')}"
         )
         return order

@@ -211,7 +211,7 @@ class ShadowModelManager:
         direction thresholds).
         """
         # OTM guard — shadow refuses to pretend to trade OTM markets.
-        if market_price < OTM_LOW or market_price > OTM_HIGH:
+        if market_price <= OTM_LOW or market_price >= OTM_HIGH:
             return ShadowDecision(shadow_prob=0.5, direction="NO_TRADE", would_trade=False)
 
         try:

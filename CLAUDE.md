@@ -32,7 +32,8 @@ Feature Engine (src/features/)
         │
         ▼
 AlphaEngine (src/engine/alpha.py)
-  OTM guard: skip if market_price < 0.15 or > 0.85  ← CRITICAL, see Lessons
+  OTM guard: skip if market_price <= 0.30 or >= 0.70  ← CRITICAL, see Lessons
+  TGTBT taint: if "too good to be true" fires on a ticker, block it for lifecycle
   CNN-LSTM (60-bar sequence)  → P(up)
   XGBoost  (13 tabular feats) → P(up)
   Ensemble → p_yes (adjusted for strike_type: greater/less)
@@ -71,6 +72,7 @@ PromotionOrchestrator → Mann-Whitney gate (p<0.05) → auto-promote or revert
 | Max open positions | 3 | `MAX_OPEN_POSITIONS` (.env) |
 | Max trades/hour | 8 | `MAX_TRADES_PER_HOUR` (.env) |
 | Min net edge | 1% | `MIN_NET_EDGE` (.env) |
+| **Max net edge** | **10%** | `MAX_NET_EDGE` (.env) — "too good to be true" ceiling |
 | **XGB YES threshold** | **0.55** | hardcoded in alpha.py |
 | **XGB NO threshold** | **0.45** | hardcoded in alpha.py |
 | CNN YES/NO threshold | 0.50 | hardcoded in alpha.py |
@@ -79,6 +81,7 @@ PromotionOrchestrator → Mann-Whitney gate (p<0.05) → auto-promote or revert
 | **Feed ATM reject LOW** | **0.30** | hardcoded in kalshi_feed.py |
 | **Feed ATM reject HIGH** | **0.70** | hardcoded in kalshi_feed.py |
 | **Per-market dedup** | **1 trade/expiry** | main.py `traded_tickers` set |
+| **TGTBT taint** | **block ticker for lifecycle** | main.py `tainted_tickers` set |
 | Cancel deadline | T−90s | hardcoded in controller.py |
 | Analysis interval | 50 trades | `ANALYSIS_INTERVAL` (.env) |
 | Shadow min trades | 50 | `SHADOW_MIN_TRADES` (.env) |
@@ -407,6 +410,112 @@ from src.learning.trade_journal import TradeJournal
 print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
 ```
 
+### MAX_NET_EDGE ceiling added (2026-04-11)
+**What happened:** 71-trade paper run (Apr 5–11) came in at 40.8% WR /
+−$127 net (p=0.022 vs 53.5% breakeven). The signal-edge bucket analysis
+was damning:
+
+| `signal_edge` | n | WR | PnL |
+|---|---|---|---|
+| 0–5% | 15 | 66.7% | +$353 |
+| 5–10% | 12 | 33.3% | −$285 |
+| 10–15% | 8 | 25.0% | −$177 |
+| 15–20% | 7 | 71.4% | +$431 |
+| **>20%** | **29** | **27.6%** | **−$194** |
+
+The largest bucket (>20%, where Kelly sized hardest) was losing at 27.6% WR.
+Matches the hypothesis: huge apparent edges come from the `P(direction)` vs
+`P(strike crossed)` mismatch on markets priced far from 0.50. `gross_edge`
+balloons exactly where the model is systematically wrong.
+
+**Fix:** Added `max_net_edge` parameter to `AlphaEngine` (default 0.10).
+Signals whose `net_edge > max_net_edge` are skipped with a `"too good to
+be true"` log line. Wired through `main.py` as `MAX_NET_EDGE` env var
+(default 0.10).
+
+**Expected effect on the Apr 5–11 sample:** drops 44 of 71 trades, keeps
+the 27 trades in the 0–10% edge band (14W/13L = 52% WR — above breakeven).
+
+**Rule:** When `net_edge > 0.10` on a 15-min binary contract, the bot is
+almost certainly answering a different question than the market. Do not
+raise this ceiling without a principled alternative (e.g., a re-calibrated
+`p_yes` that incorporates strike distance, not just directional probability).
+
+### OTM guard boundary fix + OTM_LOW restored to 0.30 (fixed 2026-04-13)
+**What happened:** A market at exactly `yes_ask=0.700` slipped past the OTM
+guard because comparisons used strict `<`/`>` instead of `<=`/`>=`. The guard
+checked `market_price > 0.70` which is `False` for 0.700. Additionally,
+`alpha.py` had `OTM_LOW = 0.25` (drifted from the documented 0.30 at some point).
+
+**Fix:** All three OTM guards (alpha.py, kalshi_feed.py, shadow_model.py) now
+use `<=`/`>=`. `OTM_LOW` restored to 0.30 in alpha.py to match kalshi_feed.py
+and shadow_model.py. Valid trading range is now `(0.30, 0.70)` exclusive of
+boundaries across all components.
+
+### TGTBT tainted ticker cooldown (added 2026-04-13)
+**What happened:** Live sequence showed the bot filtering a signal as "too good
+to be true" at 05:31 and 05:32 (market=0.60, net_edge=0.15), then entering
+the *same* market at 05:35 after the YES price dropped to 0.47 and the edge
+"normalized" to 0.053. The trade lost. The edge shrunk not because the model
+improved, but because the market moved toward the model's (wrong) estimate.
+
+**Root cause:** The TGTBT filter is stateless — it evaluates each bar
+independently. If the market reprices enough to bring `net_edge` under the
+ceiling, the filter passes, even though the fundamental model-market
+disagreement hasn't changed.
+
+**Fix:** `TradeSignal` now has a `tgtbt_filtered: bool` flag. `main.py`
+maintains a `tainted_tickers: set` — when TGTBT fires on a ticker, that
+ticker is blocked for its entire lifecycle. Cleared at settlement time.
+
+**Rule:** Once a model-market disagreement is large enough to trigger TGTBT,
+the disagreement is structural for that market cycle. The market price moving
+doesn't make the model's estimate more correct — it just makes the gap
+look smaller. Never trade a tainted ticker.
+
+---
+
+## Pending Ideas (Not Yet Implemented)
+
+### Tighten OTM_LOW from 0.30 → 0.35 or 0.38 (proposed 2026-04-11)
+The 0.30–0.40 entry bucket only hit 39% WR in Apr 5–10 live data, and the
+0.40–0.50 bucket was the worst performer in the Apr 10–11 paper overnight
+(0W/4L, −$150). Wait for post-`MAX_NET_EDGE` data before tightening further —
+`MAX_NET_EDGE` may already drain most of the bad entries in that band since
+high-edge signals cluster on OTM boundaries.
+
+Note: `OTM_LOW` was restored to 0.30 on 2026-04-13 (had drifted to 0.25).
+All three guards (alpha.py, kalshi_feed.py, shadow_model.py) now use
+`<=`/`>=` instead of `<`/`>` to prevent boundary values from slipping through.
+
+### Scalp trading infrastructure (added 2026-04-12)
+**What:** New strategy where the bot buys and sells contracts before settlement
+to profit from contract price movement, rather than holding to expiry.
+
+**Infrastructure built (Phase 1-2):**
+- `KalshiClient.place_order()` now accepts `action="buy"` or `action="sell"`
+  (was hardcoded to "buy"). Validated against `("buy", "sell")`.
+- `KalshiPriceLogger` runs as a background asyncio task in ALL modes. Polls
+  Kalshi every 5s (configurable via `SCALP_POLL_INTERVAL`), logs all active
+  KXBTC15M market bid/ask/mid + BTC spot price to `data/contract_prices.db`.
+  This builds the training dataset for the scalp ML model.
+- `KalshiFeed` extended: `_all_markets` list tracks every active market (not
+  just ATM). New methods `get_all_markets()` and `get_market_by_ticker()`.
+  `scalp_mode=True` constructor param reduces poll interval to 3s.
+- `PendingTrade` extended with scalp fields: `mode`, `exit_price`, `exit_ts`,
+  `sell_order_id`, `sell_fee`.
+
+**Still needed (future sessions, after 1-2 weeks of price data):**
+- Scalp ML model (`XGBRegressor` predicting contract price delta, not BTC direction)
+- Scalp alpha engine (entry signals with double-fee accounting)
+- Scalp position monitor (exit logic: ML-predicted, stop-loss, time-forced, take-profit)
+- Scalp risk controls (separate daily loss budget, max concurrent scalps)
+- `TRADING_MODE=scalp` env var and main loop branching
+
+**Key insight:** OTM contracts are *cheaper* to scalp than ATM because
+the fee formula `0.07 * p * (1-p)` is maximized at p=0.50. Double fees
+at 50c = 3.5c vs 1.26c at 10c. The trade-off is wider spreads on OTM.
+
 ---
 
 ## File Map (Critical Paths)
@@ -431,6 +540,8 @@ print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
 | Failure classifier | `src/learning/postmortem.py` |
 | Shadow model | `src/learning/shadow_model.py` |
 | Optuna + promotion | `src/learning/adaptation.py` |
+| Contract price logger | `src/data/kalshi_price_logger.py` |
+| Contract price DB | `data/contract_prices.db` |
 | Paper P&L tracker | `src/paper_tracker.py` |
 | Email notifications | `src/notifications.py` |
 | Trade history export | `export_trades.py` |
@@ -459,7 +570,7 @@ print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
 - [x] Continuous learning system (journal, SHAP, postmortem, shadow, Optuna)
 - [x] Heuristics rules engine with confidence decay
 - [x] Bearish market (strike_type=less) signal direction inversion
-- [x] OTM guard (market_price bounds [0.15, 0.85]) — critical bug fix
+- [x] OTM guard (market_price bounds [0.30, 0.70], `<=`/`>=`) — critical bug fix
 - [x] ATM staleness filter in KalshiFeed (withhold OTM markets)
 - [x] Kalshi settlement result parsing fix (bracketed float strings)
 - [x] signal_edge and kelly_fraction now correctly saved to trade journal
@@ -473,6 +584,12 @@ print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
 - [x] KalshiClient env parameter bug fix (KALSHI_ENV now respected)
 - [x] Paper run complete — 124 trades (56.5% win rate, +$2,082 net from $500)
 - [x] Shadow model wired into paper mode with SQLite-backed observation log
+- [x] Scalp infrastructure: sell-order support in KalshiClient (`action` param)
+- [x] Scalp infrastructure: contract price logger (background task, all modes)
+- [x] Scalp infrastructure: multi-market tracking in KalshiFeed
+- [x] OTM guard boundary fix: `<=`/`>=` in all 3 files, OTM_LOW restored to 0.30
+- [x] TGTBT tainted ticker cooldown: block ticker for lifecycle after TGTBT fires
+- [x] Competitive research: 30+ repos, academic papers, strategy catalog (see `data/research/`)
 
 ### 🔄 In Progress
 - [ ] First live trading run — $100 bankroll on prod (started 2026-04-04)
@@ -485,6 +602,11 @@ print(TradeJournal(db_path="data/trade_journal_paper.db").get_shadow_stats())
 - [ ] **Phase 6:** Shadow model promotion if candidate params improve Sharpe
 - [ ] **Phase 7:** Scale live bankroll to $500 after stable live results
 - [ ] **Phase 8:** Compound bankroll toward $1,500 target for $30–$40/day EV
+- [ ] **Scalp Phase 1:** Collect 1-2 weeks of contract price data (logger running)
+- [ ] **Scalp Phase 2:** Train scalp ML model (XGBRegressor on contract price movement)
+- [ ] **Scalp Phase 3:** Build scalp alpha engine + exit logic + position monitor
+- [ ] **Scalp Phase 4:** Paper test scalp mode for 3-5 days
+- [ ] **Scalp Phase 5:** Go live with scalp mode if paper results positive
 
 ### 💰 Revenue Milestones
 | Bankroll | Max position | EV/trade @55% win | Trades/day | Est. daily |

@@ -54,6 +54,7 @@ class TradeSignal:
     market_price:   float   # current YES market price from Kalshi
     net_edge:       float   # expected edge after fees and spread
     regime:         str     # "trending" or "ranging"
+    tgtbt_filtered: bool = False  # True if signal was killed by "too good to be true" ceiling
 
 
 class AlphaEngine:
@@ -65,6 +66,11 @@ class AlphaEngine:
     cnn_lstm_path  : path to CNN-LSTM .pt checkpoint
     xgb_path       : path to XGBoost .pkl artifact
     min_net_edge   : minimum required edge after fees/spread (default 2%)
+    max_net_edge   : "too good to be true" ceiling — skip signals whose
+                     net edge exceeds this. Huge apparent edges almost always
+                     come from the P(direction) vs P(strike crossed) mismatch
+                     on markets priced far from 0.50, where the model is
+                     systematically wrong (see CLAUDE.md Pending Ideas).
     cnn_weight     : weight for CNN-LSTM in ensemble (XGB weight = 1 - cnn_weight)
     """
 
@@ -83,11 +89,13 @@ class AlphaEngine:
         cnn_lstm_path: str,
         xgb_path: str,
         min_net_edge: float = 0.02,
+        max_net_edge: float = 0.10,
         cnn_weight: float = 0.55,
         device: str = "cpu",
         heuristics_engine=None,
     ):
         self.min_net_edge     = min_net_edge
+        self.max_net_edge     = max_net_edge
         self.cnn_weight       = cnn_weight
         self.xgb_weight       = 1.0 - cnn_weight
         self.device           = device
@@ -129,9 +137,9 @@ class AlphaEngine:
         # band was tightened to [0.30, 0.70] after 2026-04-10 when live data
         # showed 21% win rate on entries below 0.30 (see CLAUDE.md Lessons).
         # Waiting for the next ATM market is always better than trading OTM.
-        OTM_LOW  = 0.25
+        OTM_LOW  = 0.30
         OTM_HIGH = 0.70
-        if market_price < OTM_LOW or market_price > OTM_HIGH:
+        if market_price <= OTM_LOW or market_price >= OTM_HIGH:
             logger.debug(
                 f"OTM guard: market_price={market_price:.3f} outside [{OTM_LOW},{OTM_HIGH}] "
                 "— skipping bar, waiting for ATM market."
@@ -215,6 +223,22 @@ class AlphaEngine:
             )
             direction = Direction.NO_TRADE
 
+        # ── "Too good to be true" ceiling ───────────────────────────────
+        # Paper run Apr 5–11 2026: net_edge > 0.10 bucket was 12W/32L (27% WR),
+        # while net_edge ≤ 0.10 was 14W/13L (52% WR). Huge edges come from
+        # the P(direction) vs P(strike crossed) mismatch on markets priced
+        # far from 0.50 — the model is asking a different question than the
+        # market. See CLAUDE.md "MAX_NET_EDGE ceiling" in Lessons.
+        tgtbt = False
+        if direction != Direction.NO_TRADE and net_edge > self.max_net_edge:
+            logger.info(
+                f"Signal filtered (too good to be true): direction={direction.value} "
+                f"net_edge={net_edge:.4f} > MAX_NET_EDGE={self.max_net_edge} "
+                f"| market={market_price:.3f} p_yes={p_yes:.3f}"
+            )
+            direction = Direction.NO_TRADE
+            tgtbt = True
+
         signal = TradeSignal(
             direction=direction,
             cnn_lstm_prob=cnn_prob,
@@ -223,6 +247,7 @@ class AlphaEngine:
             market_price=market_price,
             net_edge=net_edge,
             regime=regime,
+            tgtbt_filtered=tgtbt,
         )
 
         # ── Apply heuristic rules ─────────────────────────────────────────

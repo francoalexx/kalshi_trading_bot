@@ -151,8 +151,12 @@ class ExecutionController:
         limit_cents = max(1, min(99, limit_cents))   # Kalshi bounds
 
         # ── Position sizing ──────────────────────────────────────────────
+        if signal.direction == Direction.BUY_YES:
+            p_win = signal.ensemble_prob
+        else:
+            p_win = 1.0 - signal.ensemble_prob
         position_usd, kelly_fraction = self._kelly_size(
-            p_model=signal.ensemble_prob,
+            p_model=p_win,
             p_market=limit_float,
         )
         if position_usd < 1.0:
